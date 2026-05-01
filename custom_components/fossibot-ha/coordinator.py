@@ -153,7 +153,10 @@ class FossibotDataUpdateCoordinator(DataUpdateCoordinator):
             "Multiple consecutive failures, initiating reconnection"
         )
         self._reconnection_in_progress = True
-        self.hass.async_create_task(self._handle_reconnection())
+        self.hass.async_create_background_task(
+            self._handle_reconnection(),
+            name="fossibot_reconnection",
+        )
 
     async def _handle_reconnection(self):
         """Handle reconnection in background."""
