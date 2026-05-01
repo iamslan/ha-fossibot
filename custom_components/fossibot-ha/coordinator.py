@@ -60,8 +60,9 @@ class FossibotDataUpdateCoordinator(DataUpdateCoordinator):
         Must be called after the coordinator is registered with hass
         (i.e. after async_config_entry_first_refresh).
         """
-        self._health_check_task = self.hass.async_create_task(
-            self._health_check_loop()
+        self._health_check_task = self.hass.async_create_background_task(
+            self._health_check_loop(),
+            name="fossibot_health_check",
         )
         self._health_check_task.add_done_callback(
             self._handle_health_check_done
