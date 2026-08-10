@@ -67,7 +67,9 @@ class FossibotSensor(FossibotEntity, SensorEntity):
 
         if device_class == SensorDeviceClass.POWER:
             self._attr_state_class = SensorStateClass.MEASUREMENT
-
+        if device_class == SensorDeviceClass.BATTERY:
+            self._attr_state_class = SensorStateClass.MEASUREMENT
+            
     @property
     def native_value(self):
         """Return the state of the sensor."""
