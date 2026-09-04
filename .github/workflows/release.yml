@@ -1,0 +1,70 @@
+name: Release
+
+# Cuts a release from whatever version manifest.json currently declares:
+# tags the dispatched ref as v<version> and publishes a GitHub release with
+# the notes in docs/release-notes/v<version>.md (auto-generated notes if
+# that file is absent). Run it from the Actions tab after the version bump
+# has landed on the branch you want to release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch or commit to release (defaults to the dispatched ref)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Read the version from manifest.json
+        id: manifest
+        run: |
+          version=$(python3 -c "import json; print(json.load(open('custom_components/fossibot-ha/manifest.json'))['version'])")
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Create the tag
+        env:
+          TAG: ${{ steps.manifest.outputs.tag }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::${TAG} already exists on the remote"
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "${TAG}"
+          git push origin "refs/tags/${TAG}"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.manifest.outputs.tag }}
+        run: |
+          notes="docs/release-notes/${TAG}.md"
+          if [ ! -f "${notes}" ]; then
+            echo "No ${notes}; falling back to auto-generated notes."
+            gh release create "${TAG}" --verify-tag --title "${TAG}" --generate-notes
+            exit 0
+          fi
+          # A leading "# ..." heading in the notes file becomes the release
+          # title, so it is not repeated at the top of the body.
+          title=$(sed -n '1{/^# /s/^# //p;}' "${notes}")
+          if [ -n "${title}" ]; then
+            tail -n +2 "${notes}" > /tmp/body.md
+          else
+            title="${TAG}"
+            cp "${notes}" /tmp/body.md
+          fi
+          gh release create "${TAG}" --verify-tag --title "${title}" --notes-file /tmp/body.md
