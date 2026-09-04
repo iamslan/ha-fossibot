@@ -1,15 +1,24 @@
 # modbus.py
-"""
-Modbus command conversion functions for Fossibot devices.
+"""Modbus command conversion functions for Fossibot devices.
 
 SAFETY NOTE: Fossibot firmware does NOT validate register write values.
 Writing an out-of-range value can permanently brick a device.  Every write
 MUST go through ``get_write_modbus()``, which validates against the
 WRITABLE_REGISTERS allowlist before encoding.
+
+Allowed ranges are taken from the Sydpower "Modbus RTU Protocol" document
+(``Inverter-Protocol-V0.docx``) section 3.1. Where that document gives an
+explicit range, the allowlist matches it exactly; the few deviations are
+called out in comments with the reason.
 """
 
 from typing import Dict, FrozenSet, List, Union
+
+# Several register constants below are re-exported rather than used directly:
+# scripts/ and external tooling import them from this module, so they are kept
+# in the namespace even though this file does not reference them all.
 from .const import (
+    MODBUS_READ_COUNT,
     REGISTER_MODBUS_ADDRESS, REGISTER_TOTAL_INPUT, REGISTER_DC_INPUT,
     REGISTER_MAXIMUM_CHARGING_CURRENT, REGISTER_USB_OUTPUT, REGISTER_DC_OUTPUT,
     REGISTER_AC_OUTPUT, REGISTER_LED, REGISTER_TOTAL_OUTPUT,
@@ -18,7 +27,11 @@ from .const import (
     REGISTER_AC_STANDBY_TIME, REGISTER_DC_STANDBY_TIME,
     REGISTER_SCREEN_REST_TIME, REGISTER_STOP_CHARGE_AFTER,
     REGISTER_DISCHARGE_LIMIT, REGISTER_CHARGING_LIMIT, REGISTER_SLEEP_TIME,
+    HREG_AC_CHARGE_LEVEL, HREG_APP_CONTROL_SLEEP, HREG_BUZZER,
+    HREG_DC_INPUT_TYPE, HREG_GRID_AC_AUTO_OUTPUT, HREG_LOW_BATTERY_NOTIFY,
+    HREG_WIFI_UPLOAD_INTERVAL,
 )
+from .registers import decode_holding_registers, decode_input_registers
 
 
 # ---------------------------------------------------------------------------
@@ -26,45 +39,102 @@ from .const import (
 #
 # Each entry maps a register number to a frozenset of allowed integer values.
 # ``get_write_modbus()`` refuses to encode a value that is not in this set.
-#
-# Source: Fossibot BrightEMS app reverse engineering (possibleValues arrays).
-# Registers without possibleValues use bounded ranges with a safety margin.
 # ---------------------------------------------------------------------------
 
+# Register 69 packs two independent 8-bit settings into one word:
+#   high byte = low-battery notification enable (0 or 1)
+#   low byte  = notification threshold in percent (0..100)
+# Writing 0xFF into either byte tells the device to leave that half alone,
+# which is how a single 16-bit write can change one setting in isolation.
+NOT_SET = 0xFF
+_LOW_BATTERY_VALUES = frozenset(
+    (enable << 8) | threshold
+    for enable in (0, 1, NOT_SET)
+    for threshold in list(range(0, 101)) + [NOT_SET]
+)
+
 WRITABLE_REGISTERS: Dict[int, FrozenSet[int]] = {
-    # Charging current: 1-20 A
+    # Holding 13 — AC charge power level. Protocol: "Range: 1-5".
+    HREG_AC_CHARGE_LEVEL: frozenset(range(1, 6)),
+
+    # Holding 15 — DC input type. Protocol: "0:MPPT 1:DC source".
+    HREG_DC_INPUT_TYPE: frozenset({0, 1}),
+
+    # Holding 20 — DC (PV / vehicle) charging current limit, 1 A per count.
+    # The protocol constrains this to "< DC Input Max Curr" (holding 17)
+    # rather than an absolute maximum, so the allowlist keeps a conservative
+    # 20 A ceiling and the number entity narrows it further using the value
+    # the device reports in holding 17.
     REGISTER_MAXIMUM_CHARGING_CURRENT: frozenset(range(1, 21)),
 
-    # Boolean outputs: 0 = off, 1 = on
+    # Holding 24/25/26 — USB / DC / AC output button state.
     REGISTER_USB_OUTPUT: frozenset({0, 1}),
     REGISTER_DC_OUTPUT: frozenset({0, 1}),
     REGISTER_AC_OUTPUT: frozenset({0, 1}),
 
-    # LED mode: 0=Off, 1=On, 2=SOS, 3=Flash
+    # Holding 27 — LED button. Modes per input register 25:
+    # 0=Off, 1=steady, 2=SOS, 3=strobe.
     REGISTER_LED: frozenset({0, 1, 2, 3}),
 
-    # AC silent charging: 0=off, 1=on
+    # Holding 54 — Wi-Fi automatic upload interval, 1 s per count.
+    # The protocol documents the unit but no range; bounded here to
+    # 5 s..1 h, comfortably inside any plausible firmware limit.
+    HREG_WIFI_UPLOAD_INTERVAL: frozenset(range(5, 3601)),
+
+    # Holding 56 — buzzer enable. Protocol: "Range: 0 and 1".
+    HREG_BUZZER: frozenset({0, 1}),
+
+    # Holding 57 — silent charging mode. Protocol: "Range: 0 and 1".
     REGISTER_AC_SILENT_CHARGING: frozenset({0, 1}),
 
-    # Standby timers (minutes)
-    REGISTER_USB_STANDBY_TIME: frozenset({0, 3, 5, 10, 30}),
-    REGISTER_AC_STANDBY_TIME: frozenset({0, 480, 960, 1440}),
-    REGISTER_DC_STANDBY_TIME: frozenset({0, 480, 960, 1440}),
+    # Holding 59/60/61 — no-load sleep timers, 1 min per count.
+    # Protocol: "Range: 1~5000 (0:no sleep)".
+    REGISTER_USB_STANDBY_TIME: frozenset(range(0, 5001)),
+    REGISTER_AC_STANDBY_TIME: frozenset(range(0, 5001)),
+    REGISTER_DC_STANDBY_TIME: frozenset(range(0, 5001)),
 
-    # Screen rest time (seconds)
-    REGISTER_SCREEN_REST_TIME: frozenset({0, 180, 300, 600, 1800}),
+    # Holding 62 — screen dim time, 1 s per count. Protocol: "Range: 1~5000".
+    # 0 is additionally allowed because the vendor app itself offers an "off"
+    # option for this setting, which is evidence the firmware accepts it.
+    REGISTER_SCREEN_REST_TIME: frozenset(range(0, 5001)),
 
-    # Sleep time (minutes)
-    REGISTER_SLEEP_TIME: frozenset({5, 10, 30, 480}),
+    # Holding 63 — AC scheduled charging time, 1 min per count.
+    # Protocol: "Range: 1~5000"; 0 disables the schedule.
+    REGISTER_STOP_CHARGE_AFTER: frozenset(range(0, 5001)),
 
-    # Stop charge after (minutes) - no possibleValues in app, allow 0-1440
-    REGISTER_STOP_CHARGE_AFTER: frozenset(range(0, 1441)),
+    # Holding 64 — app remote-shutdown function enable.
+    HREG_APP_CONTROL_SLEEP: frozenset({0, 1}),
 
-    # Discharge limit (permille in register, 0-1000 → 0-100%)
-    REGISTER_DISCHARGE_LIMIT: frozenset(range(0, 1001)),
+    # Holding 66 — minimum discharge SOC, 0.1% per count.
+    # Protocol: "Range: 0~500", i.e. a 0-50% floor. Values above 500 are
+    # refused; the integration previously allowed the full 0-100%.
+    REGISTER_DISCHARGE_LIMIT: frozenset(range(0, 501)),
 
-    # Charging limit (permille in register, 0-1000 → 0-100%)
-    REGISTER_CHARGING_LIMIT: frozenset(range(0, 1001)),
+    # Holding 67 — maximum charge SOC in UPS mode, 0.1% per count.
+    # Protocol: "Range: 600~1000", i.e. a 60-100% ceiling. Values below 600
+    # are refused; the integration previously allowed the full 0-100%.
+    REGISTER_CHARGING_LIMIT: frozenset(range(600, 1001)),
+
+    # Holding 68 — whole-unit idle auto-shutdown, 1 min per count.
+    # Protocol: "Range: 1~5000"; 0 disables auto-shutdown.
+    REGISTER_SLEEP_TIME: frozenset(range(0, 5001)),
+
+    # Holding 69 — low-battery notification enable + threshold.
+    HREG_LOW_BATTERY_NOTIFY: _LOW_BATTERY_VALUES,
+
+    # Holding 70 — automatically enable AC output in grid mode.
+    HREG_GRID_AC_AUTO_OUTPUT: frozenset({0, 1}),
+}
+
+# Registers the protocol documents as writable but this integration refuses
+# to touch, with the reason. Kept as data so the intent is testable and a
+# future contributor does not "helpfully" add them back.
+INTENTIONALLY_NOT_WRITABLE: Dict[int, str] = {
+    0: "Factory reset (device and wireless module) — destructive",
+    1: "Debug mode / version query mode — vendor diagnostics only",
+    2: "Chip type selector — vendor diagnostics only",
+    3: "Debug variable address — vendor diagnostics only",
+    4: "Timezone — no documented encoding for the offset field",
 }
 
 
@@ -149,6 +219,12 @@ def get_write_modbus(address: int, feature: int, value: int) -> List[int]:
     """
     allowed = WRITABLE_REGISTERS.get(feature)
     if allowed is None:
+        reason = INTENTIONALLY_NOT_WRITABLE.get(feature)
+        if reason:
+            raise ModbusValidationError(
+                "Register %d is not in WRITABLE_REGISTERS — refusing to "
+                "write: %s" % (feature, reason)
+            )
         raise ModbusValidationError(
             "Register %d is not in WRITABLE_REGISTERS — refusing to write" % feature
         )
@@ -161,7 +237,17 @@ def get_write_modbus(address: int, feature: int, value: int) -> List[int]:
     return aa(address, feature, [a['high'], a['low']], False)
 
 
-def get_read_modbus(address: int, count: int) -> List[int]:
+def pack_byte_pair(high: int, low: int) -> int:
+    """Pack two 8-bit settings into one register value.
+
+    Several holding registers carry two independent 8-bit settings (for
+    example register 69's notification enable and threshold). The protocol's
+    convention is to write 0xFF into the half that should stay unchanged.
+    """
+    return ((high & 0xFF) << 8) | (low & 0xFF)
+
+
+def get_read_modbus(address: int, count: int = MODBUS_READ_COUNT) -> List[int]:
     """Encode a Modbus read holding registers command (function code 03).
 
     Returns settings data on the ``client/data`` MQTT topic.
@@ -169,7 +255,9 @@ def get_read_modbus(address: int, count: int) -> List[int]:
     return ia(address, 0, count, False)
 
 
-def get_read_input_modbus(address: int, count: int) -> List[int]:
+def get_read_input_modbus(
+    address: int, count: int = MODBUS_READ_COUNT
+) -> List[int]:
     """Encode a Modbus read input registers command (function code 04).
 
     Returns sensor data (SoC, power, outputs) on the ``client/04`` topic.
@@ -189,8 +277,8 @@ def _format_allowed(allowed: FrozenSet[int]) -> str:
 # Pre-defined commands (validated at import time)
 # ---------------------------------------------------------------------------
 
-REGRequestSettings      = get_read_modbus(REGISTER_MODBUS_ADDRESS, 80)
-REGRequestSensors       = get_read_input_modbus(REGISTER_MODBUS_ADDRESS, 80)
+REGRequestSettings      = get_read_modbus(REGISTER_MODBUS_ADDRESS)
+REGRequestSensors       = get_read_input_modbus(REGISTER_MODBUS_ADDRESS)
 REGDisableUSBOutput     = get_write_modbus(REGISTER_MODBUS_ADDRESS, REGISTER_USB_OUTPUT, 0)
 REGEnableUSBOutput      = get_write_modbus(REGISTER_MODBUS_ADDRESS, REGISTER_USB_OUTPUT, 1)
 REGDisableDCOutput      = get_write_modbus(REGISTER_MODBUS_ADDRESS, REGISTER_DC_OUTPUT, 0)
@@ -209,63 +297,34 @@ REGEnableACSilentChg    = get_write_modbus(REGISTER_MODBUS_ADDRESS, REGISTER_AC_
 # Register parsing
 # ---------------------------------------------------------------------------
 
-def parse_registers(registers: List[int], topic: str) -> Dict[str, Union[int, float, bool]]:
-    """Parse device registers based on topic and return structured data."""
-    device_update = {}
+# Minimum register count worth decoding. Anything shorter is a write
+# acknowledgement rather than a data response.
+MIN_DATA_REGISTERS = 57
 
-    if len(registers) == 81:
-        if 'device/response/client/04' in topic:
-            # Get register 41 value (active outputs list)
-            register_value = registers[41]
 
-            # Replicate the JavaScript logic exactly
-            # ("0000000000000000" + e[41].toString(2).padStart(8, "0")).slice(-16)
-            binary_str = format(register_value, '016b')
+def parse_registers(
+    registers: List[int], topic: str
+) -> Dict[str, Union[int, float, bool, str, list]]:
+    """Parse device registers based on topic and return structured data.
 
-            device_update.update({
-                "soc": round(registers[56] / 1000 * 100, 1),
-                "dcInput": registers[4],
-                "totalInput": registers[6],
-                "totalOutput": registers[39],
-                "acOutputVoltage": (registers[18] / 10),
-                "acOutputFrequency": (registers[19] / 10),
-                "acInputVoltage": (registers[21] / 10),
-                "acInputFrequency": (registers[22] / 100),
+    The response payload carries the requested registers followed by the
+    frame's CRC word, so ``registers`` is one entry longer than the requested
+    count. Decoding is index-driven and every documented register lives below
+    index 72, so the trailing CRC word is simply never read — and a response
+    of an unexpected length still decodes everything it does contain.
+    """
+    # Anything shorter than this is a write acknowledgement echoing back a
+    # single register, not a data response.
+    if len(registers) < MIN_DATA_REGISTERS:
+        return {}
 
-                # Direct string indexing matches JS array indexing after split
-                "usbOutput": binary_str[6] == '1',   # Position 6: USB Output
-                "dcOutput": binary_str[5] == '1',     # Position 5: DC Output
-                "acOutput": binary_str[4] == '1',     # Position 4: AC Output
-                "ledOutput": binary_str[3] == '1',    # Position 3: LED Output
-            })
-            if registers[53] > 0:
-                device_update.update({
-                    "soc_s1": round(registers[53] / 1000 * 100 - 1, 1),
-                })
-            if registers[55] > 0:
-                device_update.update({
-                    "soc_s2": round(registers[55] / 1000 * 100 - 1, 1),
-                })
-        elif 'device/response/client/data' in topic:
-            device_update.update({
-                "acChargingRate": registers[13],
-                "maximumChargingCurrent": registers[20],
-                "acSilentCharging": (registers[57] == 1),
-                "usbStandbyTime": registers[59],
-                "acStandbyTime": registers[60],
-                "dcStandbyTime": registers[61],
-                "screenRestTime": registers[62],
-                "stopChargeAfter": registers[63],
-                "dischargeLowerLimit": (registers[66] / 10),
-                "acChargingUpperLimit": (registers[67] / 10),
-                "wholeMachineUnusedTime": registers[68]
-            })
-    elif len(registers) >= 57:
-        # Partial update with just SOC
-        device_update["soc"] = round(registers[56] / 1000 * 100, 1)
-        if registers[53] > 0:
-            device_update["soc_s1"] = round(registers[53] / 1000 * 100 - 1, 1)
-        if registers[55] > 0:
-            device_update["soc_s2"] = round(registers[55] / 1000 * 100 - 1, 1)
+    if 'device/response/client/04' in topic:
+        return decode_input_registers(registers)
 
-    return device_update
+    if 'device/response/client/data' in topic:
+        return decode_holding_registers(registers)
+
+    # Unrecognised topic: the same register numbers mean different things in
+    # the holding and input groups, so there is no safe way to decode a
+    # response whose group is unknown.
+    return {}

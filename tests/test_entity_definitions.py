@@ -1,104 +1,117 @@
-"""Tests for entity definitions: sensor, switch, select, number coverage and command completeness.
+"""Tests for entity definitions across the sensor, binary_sensor, switch,
+select and number platforms.
 
 These verify that:
-- Every parsed data key has a corresponding entity definition
-- Every command referenced by switches/selects exists in the connector's COMMANDS dict
-- Every writable register has a controllable entity (number, select, or switch)
-- No duplicate unique_id patterns exist
-"""
+- Every key ``parse_registers`` emits is either exposed by an entity or
+  explicitly accounted for as attribute-only / internal
+- Every command a switch references exists in the connector's COMMANDS dict
+- Every writable register is reachable from a controllable entity
+- Every select option and number bound is accepted by WRITABLE_REGISTERS
+- unique_id suffixes do not collide across platforms
 
-import pytest
+The definitions are imported from the platform modules themselves (see
+``conftest.py`` for the Home Assistant stubs that makes that possible), so a
+change to an entity table is checked against the protocol layer rather than
+against a hand-written copy that can silently drift.
+"""
 
 from fossibot_ha.sydpower.modbus import (
     WRITABLE_REGISTERS,
     parse_registers,
 )
+from fossibot_ha.sydpower.connector import COMMANDS as CONNECTOR_COMMANDS
 from fossibot_ha.sydpower.const import (
-    REGISTER_MAXIMUM_CHARGING_CURRENT,
-    REGISTER_USB_OUTPUT, REGISTER_DC_OUTPUT, REGISTER_AC_OUTPUT,
-    REGISTER_LED, REGISTER_AC_SILENT_CHARGING,
-    REGISTER_USB_STANDBY_TIME, REGISTER_AC_STANDBY_TIME,
-    REGISTER_DC_STANDBY_TIME, REGISTER_SCREEN_REST_TIME,
-    REGISTER_STOP_CHARGE_AFTER, REGISTER_DISCHARGE_LIMIT,
-    REGISTER_CHARGING_LIMIT, REGISTER_SLEEP_TIME,
+    REGISTER_AC_OUTPUT,
+    REGISTER_AC_SILENT_CHARGING,
+    REGISTER_DC_OUTPUT,
+    REGISTER_LED,
+    REGISTER_USB_OUTPUT,
 )
 
+from fossibot_ha.binary_sensor import BINARY_SENSOR_DEFINITIONS
+from fossibot_ha.number import NUMBER_DEFINITIONS
+from fossibot_ha.select import SELECT_DEFINITIONS
+from fossibot_ha.sensor import SENSOR_DEFINITIONS
+from fossibot_ha.switch import (
+    REGISTER_SWITCH_DEFINITIONS,
+    SWITCH_DEFINITIONS,
+)
 
-# ---------------------------------------------------------------------------
-# Inline definitions (mirroring the entity platform files)
-#
-# We can't import the actual HA entity files because they depend on
-# homeassistant imports. Instead, we replicate the definition dicts
-# and test invariants against the modbus layer.
-# ---------------------------------------------------------------------------
+SENSOR_KEYS = [d["key"] for d in SENSOR_DEFINITIONS]
+BINARY_SENSOR_KEYS = [d["key"] for d in BINARY_SENSOR_DEFINITIONS]
+SWITCH_KEYS = [d["key"] for d in SWITCH_DEFINITIONS]
+REGISTER_SWITCH_KEYS = [d["key"] for d in REGISTER_SWITCH_DEFINITIONS]
+SELECT_KEYS = [d["key"] for d in SELECT_DEFINITIONS]
+NUMBER_KEYS = [d["key"] for d in NUMBER_DEFINITIONS]
 
-# sensor.py — read-only sensors
-SENSOR_KEYS = [
-    "soc", "soc_s1", "soc_s2",
-    "dcInput", "totalInput", "acChargingRate", "totalOutput",
-    "acOutputVoltage", "acOutputFrequency", "acInputVoltage", "acInputFrequency",
-]
 
-# switch.py — boolean on/off entities
-SWITCH_DEFINITIONS = [
-    {"name": "USB Output", "key": "usbOutput", "on_command": "REGEnableUSBOutput", "off_command": "REGDisableUSBOutput"},
-    {"name": "DC Output", "key": "dcOutput", "on_command": "REGEnableDCOutput", "off_command": "REGDisableDCOutput"},
-    {"name": "AC Output", "key": "acOutput", "on_command": "REGEnableACOutput", "off_command": "REGDisableACOutput"},
-    {"name": "AC Silent Charging", "key": "acSilentCharging", "on_command": "REGEnableACSilentChg", "off_command": "REGDisableACSilentChg"},
-]
-
-# select.py — LED mode (command-based)
-LED_MODES = {
-    "Off": "REGDisableLED",
-    "On": "REGEnableLEDAlways",
-    "SOS": "REGEnableLEDSOS",
-    "Flash": "REGEnableLEDFlash",
+# Keys that are decoded but deliberately have no entity of their own.
+# Each must have a stated reason, so that adding a decoded field without
+# deciding how to surface it fails this test rather than passing silently.
+UNEXPOSED_KEYS = {
+    # Shown as attributes of the fault sensors.
+    "faults": "attribute of the Active Faults / Fault entities",
+    "faultsAc": "attribute of the Active Faults / Fault entities",
+    "faultsPv": "attribute of the Active Faults / Fault entities",
+    "faultsBms": "attribute of the Active Faults / Fault entities",
+    "faultsPanel": "attribute of the Active Faults / Fault entities",
+    # Shown as attributes of the Battery Chemistry sensor.
+    "batteryCapacityAh": "attribute of the Battery Chemistry sensor",
+    "batteryCellsSeries": "attribute of the Battery Chemistry sensor",
+    "batteryCellsParallel": "attribute of the Battery Chemistry sensor",
+    # Raw backing values for a select's decoded state.
+    "lightModeRaw": "backs the LED Mode select",
+    "dcInputTypeRaw": "backs the DC Input Type select",
+    "lightMode": "human-readable form of lightModeRaw",
+    "dcInputType": "human-readable form of dcInputTypeRaw",
+    # Raw 32-bit field; every meaningful bit has its own binary sensor.
+    "systemStateRaw": "decomposed into individual binary sensors",
+    # Surfaced through the device registry rather than as entities.
+    "serialNumber": "device_info serial_number",
+    "versionAcHardware": "device_info hw_version",
+    "versionBmsHardware": "device_info hw_version",
+    "versionPvHardware": "device_info hw_version",
+    "versionPanelHardware": "device_info hw_version",
+    "versionExternalComHardware": "device_info hw_version",
+    "versionAcSoftware": "device_info sw_version",
+    "versionBmsSoftware": "device_info sw_version",
+    "versionPvSoftware": "device_info sw_version",
+    "versionPanelSoftware": "device_info sw_version",
+    "versionExternalComSoftware": "device_info sw_version",
+    "deviceMarketType": "device_info model",
+    "deviceModelCode": "device_info model",
+    # Static hardware descriptors with no actionable use yet.
+    "deviceVoltageType": "static hardware descriptor",
+    "deviceFrequencyType": "static hardware descriptor",
+    "wirelessModules": "static hardware descriptor",
+    "storageFlag": "internal device data-storage flag",
 }
 
-# select.py — register-based selects (discrete option sets)
-REGISTER_SELECT_KEYS = [
-    {"key": "usbStandbyTime", "register": REGISTER_USB_STANDBY_TIME, "options_count": 5},
-    {"key": "acStandbyTime", "register": REGISTER_AC_STANDBY_TIME, "options_count": 4},
-    {"key": "dcStandbyTime", "register": REGISTER_DC_STANDBY_TIME, "options_count": 4},
-    {"key": "screenRestTime", "register": REGISTER_SCREEN_REST_TIME, "options_count": 5},
-    {"key": "wholeMachineUnusedTime", "register": REGISTER_SLEEP_TIME, "options_count": 4},
-]
-
-# number.py — continuous range entities
-NUMBER_DEFINITIONS = [
-    {"key": "maximumChargingCurrent", "register": REGISTER_MAXIMUM_CHARGING_CURRENT, "min": 1, "max": 20},
-    {"key": "stopChargeAfter", "register": REGISTER_STOP_CHARGE_AFTER, "min": 0, "max": 1440},
-    {"key": "dischargeLowerLimit", "register": REGISTER_DISCHARGE_LIMIT, "min": 0, "max": 100},
-    {"key": "acChargingUpperLimit", "register": REGISTER_CHARGING_LIMIT, "min": 0, "max": 100},
-]
-
-# Connector COMMANDS dict (pre-defined byte sequences)
-CONNECTOR_COMMANDS = {
-    "REGRequestSettings",
-    "REGDisableUSBOutput", "REGEnableUSBOutput",
-    "REGDisableDCOutput", "REGEnableDCOutput",
-    "REGDisableACOutput", "REGEnableACOutput",
-    "REGDisableLED", "REGEnableLEDAlways",
-    "REGEnableLEDSOS", "REGEnableLEDFlash",
-    "REGDisableACSilentChg", "REGEnableACSilentChg",
-}
-
 
 # ---------------------------------------------------------------------------
-# Full entity coverage: every parse_registers key has an entity
+# Full entity coverage: every parse_registers key is accounted for
 # ---------------------------------------------------------------------------
 
 class TestEntityCoverage:
-    """Every key emitted by parse_registers should have a corresponding entity."""
+    """Every key emitted by parse_registers should be exposed or explained."""
 
     @staticmethod
     def _all_parsed_keys():
-        """Collect every key that parse_registers can produce."""
+        """Collect every key parse_registers can produce.
+
+        The register array is filled so that optional fields (slave
+        batteries, PV energy counter, packed identity words) all decode.
+        """
         keys = set()
         regs = [0] * 81
-        regs[41] = 0xFFFF  # all outputs on
-        regs[53] = 100     # slave 1 present
-        regs[55] = 100     # slave 2 present
+        for index in range(81):
+            regs[index] = 0x0101
+        regs[41] = 0xFFFF          # every system-state high bit set
+        regs[42] = 0xFFFF          # every system-state low bit set
+        for slave in (53, 55, 66, 67):
+            regs[slave] = 500      # slave batteries present
+        for index in range(72, 80):
+            regs[index] = 0x4142   # printable serial-number characters
         keys.update(parse_registers(regs, "device/response/client/04").keys())
         keys.update(parse_registers(regs, "device/response/client/data").keys())
         return keys
@@ -106,33 +119,70 @@ class TestEntityCoverage:
     @staticmethod
     def _all_entity_keys():
         """Collect all data keys covered by any entity type."""
-        keys = set(SENSOR_KEYS)
-        keys.update(d["key"] for d in SWITCH_DEFINITIONS)
-        keys.add("ledOutput")  # LED mode select
-        keys.update(d["key"] for d in REGISTER_SELECT_KEYS)
-        keys.update(d["key"] for d in NUMBER_DEFINITIONS)
-        return keys
+        return (
+            set(SENSOR_KEYS)
+            | set(BINARY_SENSOR_KEYS)
+            | set(SWITCH_KEYS)
+            | set(REGISTER_SWITCH_KEYS)
+            | set(SELECT_KEYS)
+            | set(NUMBER_KEYS)
+        )
 
     def test_all_parsed_keys_have_entities(self):
-        parsed = self._all_parsed_keys()
-        entities = self._all_entity_keys()
-        missing = parsed - entities
+        missing = self._all_parsed_keys() - self._all_entity_keys()
+        missing -= set(UNEXPOSED_KEYS)
         assert missing == set(), (
-            "Keys from parse_registers with no entity: %s" % missing
+            "Decoded keys with neither an entity nor an UNEXPOSED_KEYS "
+            "entry: %s" % sorted(missing)
+        )
+
+    def test_unexposed_keys_are_actually_decoded(self):
+        """UNEXPOSED_KEYS should not accumulate entries for dead fields."""
+        stale = set(UNEXPOSED_KEYS) - self._all_parsed_keys()
+        assert stale == set(), (
+            "UNEXPOSED_KEYS lists keys parse_registers never emits: %s"
+            % sorted(stale)
+        )
+
+    def test_no_entity_references_an_undecoded_key(self):
+        unknown = self._all_entity_keys() - self._all_parsed_keys()
+        assert unknown == set(), (
+            "Entities bound to keys parse_registers never emits: %s"
+            % sorted(unknown)
         )
 
     def test_no_entity_key_collisions(self):
-        """No key should be claimed by multiple entity types."""
-        sensor_keys = set(SENSOR_KEYS)
-        switch_keys = {d["key"] for d in SWITCH_DEFINITIONS}
-        select_keys = {"ledOutput"} | {d["key"] for d in REGISTER_SELECT_KEYS}
-        number_keys = {d["key"] for d in NUMBER_DEFINITIONS}
+        """A key should be claimed by exactly one platform."""
+        groups = {
+            "sensor": set(SENSOR_KEYS),
+            "binary_sensor": set(BINARY_SENSOR_KEYS),
+            "switch": set(SWITCH_KEYS) | set(REGISTER_SWITCH_KEYS),
+            "select": set(SELECT_KEYS),
+            "number": set(NUMBER_KEYS),
+        }
+        seen: dict[str, str] = {}
+        collisions = []
+        for platform, keys in groups.items():
+            for key in keys:
+                if key in seen:
+                    collisions.append((key, seen[key], platform))
+                seen[key] = platform
+        assert collisions == [], "Keys claimed by two platforms: %s" % collisions
 
-        all_groups = [sensor_keys, switch_keys, select_keys, number_keys]
-        all_keys = []
-        for g in all_groups:
-            all_keys.extend(g)
-        assert len(all_keys) == len(set(all_keys)), "Duplicate key across entity types"
+    def test_no_unique_id_collisions(self):
+        """unique_id suffixes must be distinct across every platform."""
+        suffixes = (
+            SENSOR_KEYS
+            + BINARY_SENSOR_KEYS
+            + SWITCH_KEYS
+            + REGISTER_SWITCH_KEYS
+            + NUMBER_KEYS
+            + [d.get("unique_id_suffix") or d["key"] for d in SELECT_DEFINITIONS]
+        )
+        duplicates = {s for s in suffixes if suffixes.count(s) > 1}
+        assert duplicates == set(), (
+            "Duplicate unique_id suffixes: %s" % sorted(duplicates)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -143,63 +193,123 @@ class TestSensorDefinitions:
     def test_no_duplicate_sensor_keys(self):
         assert len(SENSOR_KEYS) == len(set(SENSOR_KEYS))
 
-    def test_sensors_are_read_only(self):
-        """No sensor key should correspond to a writable register entity."""
-        number_keys = {d["key"] for d in NUMBER_DEFINITIONS}
-        select_keys = {d["key"] for d in REGISTER_SELECT_KEYS}
-        controllable = number_keys | select_keys
-        overlap = set(SENSOR_KEYS) & controllable
-        assert overlap == set(), (
-            "These keys are sensors but should be number/select: %s" % overlap
+    def test_every_sensor_has_a_name(self):
+        for defn in SENSOR_DEFINITIONS:
+            assert defn["name"], defn
+
+    def test_no_duplicate_sensor_names(self):
+        names = [d["name"] for d in SENSOR_DEFINITIONS]
+        assert len(names) == len(set(names))
+
+
+# ---------------------------------------------------------------------------
+# Binary sensor
+# ---------------------------------------------------------------------------
+
+class TestBinarySensorDefinitions:
+    def test_no_duplicate_keys(self):
+        assert len(BINARY_SENSOR_KEYS) == len(set(BINARY_SENSOR_KEYS))
+
+    def test_no_duplicate_names(self):
+        names = [d["name"] for d in BINARY_SENSOR_DEFINITIONS]
+        assert len(names) == len(set(names))
+
+    def test_every_system_state_bit_is_exposed(self):
+        """Each named bit of the 32-bit system-state field needs an entity.
+
+        This is the gap the platform was added to close: the integration used
+        to read only register 41 and surface four of the bits.
+        """
+        from fossibot_ha.sydpower.registers import SYSTEM_STATE_BITS
+
+        covered = (
+            set(BINARY_SENSOR_KEYS)
+            | set(SWITCH_KEYS)
+            | set(REGISTER_SWITCH_KEYS)
+        )
+        missing = set(SYSTEM_STATE_BITS.values()) - covered
+        assert missing == set(), (
+            "System-state bits with no entity: %s" % sorted(missing)
         )
 
 
 # ---------------------------------------------------------------------------
-# Switch command completeness
+# Switch
 # ---------------------------------------------------------------------------
 
 class TestSwitchCommands:
     def test_all_switch_commands_in_connector(self):
         for defn in SWITCH_DEFINITIONS:
-            assert defn["on_command"] in CONNECTOR_COMMANDS, (
-                "%s on_command not in COMMANDS" % defn["name"]
+            for field in ("on_command", "off_command"):
+                assert defn[field] in CONNECTOR_COMMANDS, (
+                    "Switch '%s' references unknown command '%s'"
+                    % (defn["key"], defn[field])
+                )
+
+    def test_register_switch_values_are_writable(self):
+        for defn in REGISTER_SWITCH_DEFINITIONS:
+            allowed = WRITABLE_REGISTERS.get(defn["register"])
+            assert allowed is not None, (
+                "Switch '%s' writes register %d, which is not writable"
+                % (defn["key"], defn["register"])
             )
-            assert defn["off_command"] in CONNECTOR_COMMANDS, (
-                "%s off_command not in COMMANDS" % defn["name"]
-            )
+            for field in ("on_value", "off_value"):
+                assert defn[field] in allowed, (
+                    "Switch '%s' %s=%d is not allowed for register %d"
+                    % (defn["key"], field, defn[field], defn["register"])
+                )
 
     def test_no_duplicate_switch_keys(self):
-        keys = [d["key"] for d in SWITCH_DEFINITIONS]
+        keys = SWITCH_KEYS + REGISTER_SWITCH_KEYS
         assert len(keys) == len(set(keys))
 
 
 # ---------------------------------------------------------------------------
-# Select (LED + register-based)
+# Select
 # ---------------------------------------------------------------------------
 
 class TestSelectDefinitions:
-    def test_all_led_commands_in_connector(self):
-        for mode, command in LED_MODES.items():
-            assert command in CONNECTOR_COMMANDS, (
-                "LED mode '%s' → '%s' not in COMMANDS" % (mode, command)
-            )
+    def test_every_select_option_is_writable(self):
+        """Every offered option must be a value the safety map accepts.
 
-    def test_led_mode_count_matches_register(self):
-        assert len(LED_MODES) == len(WRITABLE_REGISTERS[REGISTER_LED])
-
-    def test_register_select_options_match_writable_registers(self):
-        """Each register select should have exactly as many options as
-        allowed values in WRITABLE_REGISTERS."""
-        for defn in REGISTER_SELECT_KEYS:
-            allowed = WRITABLE_REGISTERS[defn["register"]]
-            assert defn["options_count"] == len(allowed), (
-                "Select '%s' has %d options but register allows %d values"
-                % (defn["key"], defn["options_count"], len(allowed))
+        The previous invariant required the option count to equal the number
+        of allowed register values, which no longer holds: the protocol allows
+        a 0~5000 range on the timer registers while the dropdowns offer a
+        handful of useful presets.
+        """
+        for defn in SELECT_DEFINITIONS:
+            allowed = WRITABLE_REGISTERS.get(defn["register"])
+            assert allowed is not None, (
+                "Select '%s' writes register %d, which is not writable"
+                % (defn["key"], defn["register"])
             )
+            for label, value in defn["options"].items():
+                assert value in allowed, (
+                    "Select '%s' option '%s' (%d) is not allowed for "
+                    "register %d" % (defn["key"], label, value, defn["register"])
+                )
+
+    def test_led_mode_covers_every_allowed_value(self):
+        led = next(d for d in SELECT_DEFINITIONS if d["register"] == REGISTER_LED)
+        assert set(led["options"].values()) == set(WRITABLE_REGISTERS[REGISTER_LED])
+
+    def test_led_mode_reads_back_from_the_device(self):
+        """LED mode is set through holding 27 but reported by input 25.
+
+        Reading it back is what lets the select show SOS and Flash; the
+        earlier command-based select had to remember the last choice and
+        could only ever report Off or On.
+        """
+        led = next(d for d in SELECT_DEFINITIONS if d["register"] == REGISTER_LED)
+        assert led["key"] == "lightModeRaw"
 
     def test_no_duplicate_select_keys(self):
-        keys = [d["key"] for d in REGISTER_SELECT_KEYS]
-        assert len(keys) == len(set(keys))
+        assert len(SELECT_KEYS) == len(set(SELECT_KEYS))
+
+    def test_option_values_unique_within_a_select(self):
+        for defn in SELECT_DEFINITIONS:
+            values = list(defn["options"].values())
+            assert len(values) == len(set(values)), defn["key"]
 
 
 # ---------------------------------------------------------------------------
@@ -214,9 +324,44 @@ class TestNumberDefinitions:
                 % (defn["key"], defn["register"])
             )
 
+    def test_number_bounds_are_writable(self):
+        """The slider extremes must encode to values the safety map accepts.
+
+        This is what would have caught the discharge/charge limit sliders
+        offering 0-100% while the protocol documents 0-50% and 60-100%.
+        """
+        for defn in NUMBER_DEFINITIONS:
+            allowed = WRITABLE_REGISTERS[defn["register"]]
+            pack_high = defn.get("pack_high")
+            for bound in ("min_value", "max_value"):
+                raw = int(round(defn[bound] * defn["multiplier"]))
+                if pack_high is not None:
+                    raw = (pack_high << 8) | raw
+                assert raw in allowed, (
+                    "Number '%s' %s=%s encodes to %d, which register %d does "
+                    "not allow"
+                    % (defn["key"], bound, defn[bound], raw, defn["register"])
+                )
+
+    def test_number_step_stays_within_allowed_values(self):
+        """Walking the slider must never produce a rejected value."""
+        for defn in NUMBER_DEFINITIONS:
+            allowed = WRITABLE_REGISTERS[defn["register"]]
+            pack_high = defn.get("pack_high")
+            value = defn["min_value"]
+            while value <= defn["max_value"]:
+                raw = int(round(value * defn["multiplier"]))
+                if pack_high is not None:
+                    raw = (pack_high << 8) | raw
+                assert raw in allowed, (
+                    "Number '%s' value %s encodes to %d, which register %d "
+                    "does not allow"
+                    % (defn["key"], value, raw, defn["register"])
+                )
+                value += defn["step"]
+
     def test_no_duplicate_number_keys(self):
-        keys = [d["key"] for d in NUMBER_DEFINITIONS]
-        assert len(keys) == len(set(keys))
+        assert len(NUMBER_KEYS) == len(set(NUMBER_KEYS))
 
 
 # ---------------------------------------------------------------------------
@@ -228,37 +373,30 @@ class TestWritableRegisterEntityMapping:
 
     @staticmethod
     def _all_entity_registers():
-        """Collect all register IDs that have a controllable entity."""
-        regs = set()
-        # Switches: boolean registers
-        reg_map = {
-            REGISTER_USB_OUTPUT, REGISTER_DC_OUTPUT,
-            REGISTER_AC_OUTPUT, REGISTER_AC_SILENT_CHARGING,
+        regs = {
+            # Command-based switches write these through the connector's
+            # pre-encoded COMMANDS rather than naming a register.
+            REGISTER_USB_OUTPUT,
+            REGISTER_DC_OUTPUT,
+            REGISTER_AC_OUTPUT,
+            REGISTER_AC_SILENT_CHARGING,
         }
-        regs.update(reg_map)
-        # LED select
-        regs.add(REGISTER_LED)
-        # Register-based selects
-        for defn in REGISTER_SELECT_KEYS:
-            regs.add(defn["register"])
-        # Numbers
-        for defn in NUMBER_DEFINITIONS:
-            regs.add(defn["register"])
+        regs.update(d["register"] for d in REGISTER_SWITCH_DEFINITIONS)
+        regs.update(d["register"] for d in SELECT_DEFINITIONS)
+        regs.update(d["register"] for d in NUMBER_DEFINITIONS)
         return regs
 
     def test_every_writable_register_has_entity(self):
-        entity_regs = self._all_entity_registers()
-        writable_regs = set(WRITABLE_REGISTERS.keys())
-        missing = writable_regs - entity_regs
+        missing = set(WRITABLE_REGISTERS) - self._all_entity_registers()
         assert missing == set(), (
-            "Writable registers with no entity: %s" % missing
+            "Writable registers with no entity: %s" % sorted(missing)
         )
 
     def test_boolean_registers_have_switches(self):
-        for reg in [REGISTER_USB_OUTPUT, REGISTER_DC_OUTPUT,
-                    REGISTER_AC_OUTPUT, REGISTER_AC_SILENT_CHARGING]:
+        for reg in (REGISTER_USB_OUTPUT, REGISTER_DC_OUTPUT,
+                    REGISTER_AC_OUTPUT, REGISTER_AC_SILENT_CHARGING):
             assert WRITABLE_REGISTERS[reg] == frozenset({0, 1})
 
-    def test_led_register_has_select(self):
-        switch_keys = {d["key"] for d in SWITCH_DEFINITIONS}
-        assert "ledOutput" not in switch_keys
+    def test_led_register_has_select_not_switch(self):
+        assert "ledOutput" not in SWITCH_KEYS
+        assert REGISTER_LED in {d["register"] for d in SELECT_DEFINITIONS}

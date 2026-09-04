@@ -15,7 +15,10 @@ from .modbus import (
     REGEnableACSilentChg, get_read_modbus, get_read_input_modbus,
     get_write_modbus, ModbusValidationError,
 )
-from .const import REGISTER_MODBUS_ADDRESS, DEFAULT_MQTT_PORT
+from .const import (
+    REGISTER_MODBUS_ADDRESS, REGISTER_MAXIMUM_CHARGING_CURRENT,
+    DEFAULT_MQTT_PORT, MODBUS_READ_COUNT, MODBUS_MAX_READ_COUNT,
+)
 
 COMMANDS = {
     "REGRequestSettings": REGRequestSettings,
@@ -411,7 +414,18 @@ class SydpowerConnector:
         modbus_addr = device_info.get(
             "_modbus_address", REGISTER_MODBUS_ADDRESS
         )
-        modbus_count = device_info.get("_modbus_count", 80)
+        modbus_count = device_info.get("_modbus_count", MODBUS_READ_COUNT)
+
+        # The protocol caps a single read at 100 words and requires the range
+        # to stay inside one 100-register block, so a larger count from the
+        # API would produce a request the device cannot answer.
+        if modbus_count > MODBUS_MAX_READ_COUNT:
+            self._logger.warning(
+                "API reported modbus_count=%d for %s, clamping to protocol "
+                "maximum of %d",
+                modbus_count, device_mac, MODBUS_MAX_READ_COUNT,
+            )
+            modbus_count = MODBUS_MAX_READ_COUNT
 
         if func == 3:
             # Send func 03 (holding registers)
@@ -475,6 +489,21 @@ class SydpowerConnector:
             modbus_addr = device_info.get(
                 "_modbus_address", REGISTER_MODBUS_ADDRESS
             )
+
+            # Holding 20 is bounded by holding 17 ("DC Input Max Curr"), which
+            # is device-specific and therefore cannot live in the static
+            # allowlist. Enforce it here as well as in the number entity, so
+            # a service call that bypasses the UI is still checked.
+            if register == REGISTER_MAXIMUM_CHARGING_CURRENT:
+                device_max = device_info.get("dcInputMaxCurrent")
+                if isinstance(device_max, int) and 0 < device_max < reg_value:
+                    self._logger.error(
+                        "Refused to write %d A to register %d: device reports "
+                        "a maximum DC charging current of %d A",
+                        reg_value, register, device_max,
+                    )
+                    return False
+
             try:
                 command_bytes = get_write_modbus(
                     modbus_addr, register, reg_value,

@@ -11,7 +11,9 @@ import paho.mqtt.client as mqtt
 
 from .const import DEFAULT_MQTT_PORT
 from .logger import SmartLogger
-from .modbus import REGRequestSettings, parse_registers, high_low_to_int
+from .modbus import (
+    MIN_DATA_REGISTERS, REGRequestSettings, high_low_to_int, parse_registers,
+)
 
 CONNECTION_CODES = {
     0: "Connection successful",
@@ -215,7 +217,7 @@ class MQTTClient:
                 for i in range(0, len(data_bytes), 2)
             ]
 
-            if len(registers) < 57:
+            if len(registers) < MIN_DATA_REGISTERS:
                 # Short responses (e.g. 1 register) are normal write ACKs
                 self._logger.debug(
                     "Short response (%d registers) from %s — likely write ACK",
