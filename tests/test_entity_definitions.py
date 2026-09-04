@@ -2,6 +2,8 @@
 select and number platforms.
 
 These verify that:
+- Every definition can actually construct its entity: the keys of the dict
+  match the entity's ``__init__`` signature
 - Every key ``parse_registers`` emits is either exposed by an entity or
   explicitly accounted for as attribute-only / internal
 - Every command a switch references exists in the connector's COMMANDS dict
@@ -14,6 +16,8 @@ The definitions are imported from the platform modules themselves (see
 change to an entity table is checked against the protocol layer rather than
 against a hand-written copy that can silently drift.
 """
+
+import inspect
 
 from fossibot_ha.sydpower.modbus import (
     WRITABLE_REGISTERS,
@@ -28,13 +32,18 @@ from fossibot_ha.sydpower.const import (
     REGISTER_USB_OUTPUT,
 )
 
-from fossibot_ha.binary_sensor import BINARY_SENSOR_DEFINITIONS
-from fossibot_ha.number import NUMBER_DEFINITIONS
-from fossibot_ha.select import SELECT_DEFINITIONS
-from fossibot_ha.sensor import SENSOR_DEFINITIONS
+from fossibot_ha.binary_sensor import (
+    BINARY_SENSOR_DEFINITIONS,
+    FossibotBinarySensor,
+)
+from fossibot_ha.number import NUMBER_DEFINITIONS, FossibotNumber
+from fossibot_ha.select import SELECT_DEFINITIONS, FossibotRegisterSelect
+from fossibot_ha.sensor import SENSOR_DEFINITIONS, FossibotSensor
 from fossibot_ha.switch import (
     REGISTER_SWITCH_DEFINITIONS,
     SWITCH_DEFINITIONS,
+    FossibotRegisterSwitch,
+    FossibotSwitch,
 )
 
 SENSOR_KEYS = [d["key"] for d in SENSOR_DEFINITIONS]
@@ -43,6 +52,52 @@ SWITCH_KEYS = [d["key"] for d in SWITCH_DEFINITIONS]
 REGISTER_SWITCH_KEYS = [d["key"] for d in REGISTER_SWITCH_DEFINITIONS]
 SELECT_KEYS = [d["key"] for d in SELECT_DEFINITIONS]
 NUMBER_KEYS = [d["key"] for d in NUMBER_DEFINITIONS]
+
+# Each entity is constructed as ``Entity(coordinator, device_id, **defn)``, so
+# every definition table is paired with the class it feeds.
+DEFINITION_TABLES = [
+    ("sensor", "SENSOR_DEFINITIONS", SENSOR_DEFINITIONS, FossibotSensor),
+    ("binary_sensor", "BINARY_SENSOR_DEFINITIONS", BINARY_SENSOR_DEFINITIONS,
+     FossibotBinarySensor),
+    ("switch", "SWITCH_DEFINITIONS", SWITCH_DEFINITIONS, FossibotSwitch),
+    ("switch", "REGISTER_SWITCH_DEFINITIONS", REGISTER_SWITCH_DEFINITIONS,
+     FossibotRegisterSwitch),
+    ("select", "SELECT_DEFINITIONS", SELECT_DEFINITIONS,
+     FossibotRegisterSelect),
+    ("number", "NUMBER_DEFINITIONS", NUMBER_DEFINITIONS, FossibotNumber),
+]
+
+
+# ---------------------------------------------------------------------------
+# Constructability
+#
+# A platform builds its entity list in one comprehension, so a single
+# definition whose keys do not match the entity's ``__init__`` raises before
+# ``async_add_entities`` is called and takes the *whole* platform down with
+# it -- the symptom being a pile of missing entities and one terse
+# "missing 1 required positional argument" line in the log. Binding the
+# definitions against the signatures catches that at test time.
+# ---------------------------------------------------------------------------
+
+class TestDefinitionsMatchEntitySignatures:
+    """Every definition must satisfy the signature of the entity it feeds."""
+
+    def test_definitions_bind_to_their_entity(self):
+        errors = []
+        for platform, table_name, definitions, entity_class in DEFINITION_TABLES:
+            signature = inspect.signature(entity_class.__init__)
+            for defn in definitions:
+                try:
+                    # self, coordinator and device_id are supplied positionally
+                    # by the platform; the definition provides the rest.
+                    signature.bind(None, None, "device-id", **defn)
+                except TypeError as err:
+                    errors.append(
+                        "%s.%s entry %r does not match %s.__init__: %s"
+                        % (platform, table_name, defn.get("name"),
+                           entity_class.__name__, err)
+                    )
+        assert errors == [], "\n".join(errors)
 
 
 # Keys that are decoded but deliberately have no entity of their own.

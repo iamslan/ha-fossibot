@@ -41,11 +41,13 @@ SENSOR_DEFINITIONS = [
     {"name": "State of Charge Slave 3", "key": "soc_s3", "unit": "%", "device_class": BATTERY},  # input 66
     {"name": "State of Charge Slave 4", "key": "soc_s4", "unit": "%", "device_class": BATTERY},  # input 67
     {"name": "Battery Usable Capacity", "key": "batteryUsableCapacity", "unit": "Ah",
-     "state_class": SensorStateClass.MEASUREMENT},  # input 54
+     "device_class": None, "state_class": SensorStateClass.MEASUREMENT},  # input 54
     {"name": "Average Discharge SoC", "key": "averageDischargeSoc", "unit": "%",
-     "state_class": SensorStateClass.MEASUREMENT, "category": DIAGNOSTIC},  # input 70
+     "device_class": None, "state_class": SensorStateClass.MEASUREMENT,
+     "category": DIAGNOSTIC},  # input 70
     {"name": "Average Charge SoC", "key": "averageChargeSoc", "unit": "%",
-     "state_class": SensorStateClass.MEASUREMENT, "category": DIAGNOSTIC},  # input 71
+     "device_class": None, "state_class": SensorStateClass.MEASUREMENT,
+     "category": DIAGNOSTIC},  # input 71
 
     # --- Input power -----------------------------------------------------
     {"name": "AC Input", "key": "acInput", "unit": "W", "device_class": POWER},  # input 03
@@ -178,8 +180,8 @@ class FossibotSensor(FossibotEntity, SensorEntity):
         device_id: str,
         name: str,
         key: str,
-        unit: str | None,
-        device_class: SensorDeviceClass | None,
+        unit: str | None = None,
+        device_class: SensorDeviceClass | None = None,
         state_class: SensorStateClass | None = None,
         category: EntityCategory | None = None,
         default_enabled: bool = True,
