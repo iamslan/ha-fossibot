@@ -21,6 +21,9 @@ from fossibot_ha.sydpower.modbus import (
     parse_registers,
     ModbusValidationError,
     WRITABLE_REGISTERS,
+    INTENTIONALLY_NOT_WRITABLE,
+    NOT_SET,
+    pack_byte_pair,
     # Pre-defined commands
     REGRequestSettings,
     REGRequestSensors,
@@ -53,6 +56,13 @@ from fossibot_ha.sydpower.const import (
     REGISTER_DISCHARGE_LIMIT,
     REGISTER_CHARGING_LIMIT,
     REGISTER_SLEEP_TIME,
+    HREG_AC_CHARGE_LEVEL,
+    HREG_APP_CONTROL_SLEEP,
+    HREG_BUZZER,
+    HREG_DC_INPUT_TYPE,
+    HREG_GRID_AC_AUTO_OUTPUT,
+    HREG_LOW_BATTERY_NOTIFY,
+    HREG_WIFI_UPLOAD_INTERVAL,
 )
 
 
@@ -244,22 +254,41 @@ class TestWritableRegisters:
 
     def test_all_expected_registers_present(self):
         expected = {
+            HREG_AC_CHARGE_LEVEL,
+            HREG_DC_INPUT_TYPE,
             REGISTER_MAXIMUM_CHARGING_CURRENT,
             REGISTER_USB_OUTPUT,
             REGISTER_DC_OUTPUT,
             REGISTER_AC_OUTPUT,
             REGISTER_LED,
+            HREG_WIFI_UPLOAD_INTERVAL,
+            HREG_BUZZER,
             REGISTER_AC_SILENT_CHARGING,
             REGISTER_USB_STANDBY_TIME,
             REGISTER_AC_STANDBY_TIME,
             REGISTER_DC_STANDBY_TIME,
             REGISTER_SCREEN_REST_TIME,
-            REGISTER_SLEEP_TIME,
             REGISTER_STOP_CHARGE_AFTER,
+            HREG_APP_CONTROL_SLEEP,
             REGISTER_DISCHARGE_LIMIT,
             REGISTER_CHARGING_LIMIT,
+            REGISTER_SLEEP_TIME,
+            HREG_LOW_BATTERY_NOTIFY,
+            HREG_GRID_AC_AUTO_OUTPUT,
         }
         assert expected == set(WRITABLE_REGISTERS.keys())
+
+    def test_no_register_is_both_writable_and_forbidden(self):
+        overlap = set(WRITABLE_REGISTERS) & set(INTENTIONALLY_NOT_WRITABLE)
+        assert overlap == set(), (
+            "Registers listed as both writable and forbidden: %s" % overlap
+        )
+
+    def test_forbidden_registers_are_refused_with_a_reason(self):
+        for register, reason in INTENTIONALLY_NOT_WRITABLE.items():
+            with pytest.raises(ModbusValidationError, match="refusing to write"):
+                get_write_modbus(REGISTER_MODBUS_ADDRESS, register, 0)
+            assert reason
 
     def test_all_values_are_frozensets(self):
         for reg, allowed in WRITABLE_REGISTERS.items():
@@ -285,34 +314,50 @@ class TestWritableRegisters:
         assert 20 in allowed      # max
         assert 21 not in allowed  # over max
 
-    def test_usb_standby_time(self):
-        assert WRITABLE_REGISTERS[REGISTER_USB_STANDBY_TIME] == frozenset({0, 3, 5, 10, 30})
+    @pytest.mark.parametrize("register", [
+        REGISTER_USB_STANDBY_TIME,
+        REGISTER_AC_STANDBY_TIME,
+        REGISTER_DC_STANDBY_TIME,
+        REGISTER_SCREEN_REST_TIME,
+        REGISTER_STOP_CHARGE_AFTER,
+        REGISTER_SLEEP_TIME,
+    ])
+    def test_timer_registers_use_documented_range(self, register):
+        """Protocol: "Range: 1~5000", with 0 meaning no sleep / disabled."""
+        assert WRITABLE_REGISTERS[register] == frozenset(range(0, 5001))
 
-    def test_ac_standby_time(self):
-        assert WRITABLE_REGISTERS[REGISTER_AC_STANDBY_TIME] == frozenset({0, 480, 960, 1440})
-
-    def test_dc_standby_time(self):
-        assert WRITABLE_REGISTERS[REGISTER_DC_STANDBY_TIME] == frozenset({0, 480, 960, 1440})
-
-    def test_screen_rest_time(self):
-        assert WRITABLE_REGISTERS[REGISTER_SCREEN_REST_TIME] == frozenset({0, 180, 300, 600, 1800})
-
-    def test_sleep_time(self):
-        assert WRITABLE_REGISTERS[REGISTER_SLEEP_TIME] == frozenset({5, 10, 30, 480})
-
-    def test_discharge_limit_boundaries(self):
+    def test_discharge_limit_clamped_to_spec(self):
+        """Holding 66: protocol range 0~500 (0.1%/count) = a 0-50% floor."""
         allowed = WRITABLE_REGISTERS[REGISTER_DISCHARGE_LIMIT]
         assert 0 in allowed
-        assert 1000 in allowed
+        assert 500 in allowed
+        assert 501 not in allowed
+        assert 1000 not in allowed   # a 100% floor is out of spec
         assert -1 not in allowed
+
+    def test_charging_limit_clamped_to_spec(self):
+        """Holding 67: protocol range 600~1000 (0.1%/count) = a 60-100% cap."""
+        allowed = WRITABLE_REGISTERS[REGISTER_CHARGING_LIMIT]
+        assert 600 in allowed
+        assert 1000 in allowed
+        assert 599 not in allowed
+        assert 0 not in allowed      # a 0% ceiling is out of spec
         assert 1001 not in allowed
 
-    def test_charging_limit_boundaries(self):
-        allowed = WRITABLE_REGISTERS[REGISTER_CHARGING_LIMIT]
-        assert 0 in allowed
-        assert 1000 in allowed
-        assert -1 not in allowed
-        assert 1001 not in allowed
+    def test_ac_charge_level_range(self):
+        """Holding 13: protocol "Range: 1-5"."""
+        assert WRITABLE_REGISTERS[HREG_AC_CHARGE_LEVEL] == frozenset(range(1, 6))
+
+    def test_low_battery_notify_packs_two_bytes(self):
+        allowed = WRITABLE_REGISTERS[HREG_LOW_BATTERY_NOTIFY]
+        # Enable on, threshold left untouched.
+        assert pack_byte_pair(1, NOT_SET) in allowed
+        # Threshold 20%, enable left untouched.
+        assert pack_byte_pair(NOT_SET, 20) in allowed
+        # A threshold above 100% is not a valid percentage.
+        assert pack_byte_pair(NOT_SET, 101) not in allowed
+        # An enable byte other than 0/1/0xFF is undefined.
+        assert pack_byte_pair(2, 20) not in allowed
 
 
 # ---------------------------------------------------------------------------
@@ -368,12 +413,26 @@ class TestWriteValidation:
         with pytest.raises(ModbusValidationError):
             get_write_modbus(REGISTER_MODBUS_ADDRESS, REGISTER_LED, 4)
 
-    def test_usb_standby_invalid_raises(self):
+    def test_usb_standby_above_range_raises(self):
         with pytest.raises(ModbusValidationError):
             get_write_modbus(
                 REGISTER_MODBUS_ADDRESS,
                 REGISTER_USB_STANDBY_TIME,
-                7,  # not in {0, 3, 5, 10, 30}
+                5001,  # protocol range is 1~5000, plus 0 for "no sleep"
+            )
+
+    def test_discharge_limit_above_spec_raises(self):
+        """A 100% discharge floor used to be accepted; holding 66 caps at 500."""
+        with pytest.raises(ModbusValidationError):
+            get_write_modbus(
+                REGISTER_MODBUS_ADDRESS, REGISTER_DISCHARGE_LIMIT, 1000,
+            )
+
+    def test_charging_limit_below_spec_raises(self):
+        """A sub-60% charge ceiling used to be accepted; holding 67 starts at 600."""
+        with pytest.raises(ModbusValidationError):
+            get_write_modbus(
+                REGISTER_MODBUS_ADDRESS, REGISTER_CHARGING_LIMIT, 500,
             )
 
     def test_negative_value_raises(self):
@@ -520,11 +579,15 @@ class TestParseRegisters:
         result = parse_registers(regs, "device/response/client/data")
         assert result["acSilentCharging"] is False
 
-    def test_partial_update_soc_only(self):
-        regs = self._make_registers(length=57, overrides={56: 500})
+    def test_partial_response_decodes_what_it_contains(self):
+        """Decoding is index-driven, so a short response yields every register
+        it actually carries instead of collapsing to SOC only."""
+        regs = self._make_registers(length=57, overrides={6: 300, 56: 500})
         result = parse_registers(regs, "device/response/client/04")
         assert result["soc"] == 50.0
-        assert "totalInput" not in result  # not a full 81-register update
+        assert result["totalInput"] == 300
+        # Register 60 is past the end of this response and must stay absent.
+        assert "pvEnergyTotal" not in result
 
     def test_partial_update_with_slaves(self):
         regs = self._make_registers(length=60, overrides={53: 700, 55: 0, 56: 500})

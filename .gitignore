@@ -11,6 +11,9 @@ __pycache__
 # misc
 .coverage
 .vscode
+.claude-flow
+# packaged release artifacts — HACS builds these from the tag, not the tree
+custom_components/*.zip
 coverage.xml
 .ruff_cache
 *.code-workspace
