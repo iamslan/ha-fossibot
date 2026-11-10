@@ -55,7 +55,7 @@ platform and should work:
 
 | Brand | Models |
 |-------|--------|
-| **FOSSiBOT** | F1200, F2400, F3600, F3600 Pro |
+| **FOSSiBOT** | F1200, F2400, F3600, F3600 Pro, F7200 (protocol V1, sensors only — see below) |
 | **AFERIY** | P210, P310 |
 | **Eco Play (ECOPLAY)** | SYD2400, SYD3600, 3600 Pro |
 | **ABOK Power** | Ark3600 |
@@ -322,6 +322,16 @@ it — Home Assistant being able to reach the broker is not sufficient.
 **Slave battery sensors read "unknown".**
 Expected when no expansion battery is attached; the register reports "not
 connected" and the sensor stays empty rather than showing 0%.
+
+## Protocol V1 stations (F7200)
+
+Newer stations report protocol version 1 in holding register 7 and use a
+different register layout (`sydpower/registers_v1.py`, indices taken from the
+BrightEMS app bundle). The integration detects this from the first settings
+frame and decodes with the V1 table: inputs, SoC, state bits, timers and the
+PV energy counters. Outputs on V1 are bits of input register 75 rather than
+holding registers 24-26, and the write path is not implemented yet, so such a
+device gets sensors and binary sensors only — no switches, selects or numbers.
 
 ## Not supported
 

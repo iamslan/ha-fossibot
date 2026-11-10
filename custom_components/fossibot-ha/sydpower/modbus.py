@@ -32,6 +32,10 @@ from .const import (
     HREG_WIFI_UPLOAD_INTERVAL,
 )
 from .registers import decode_holding_registers, decode_input_registers
+from .registers_v1 import (
+    PROTOCOL_V1, decode_holding_registers_v1, decode_input_registers_v1,
+    detect_protocol,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -303,9 +307,13 @@ MIN_DATA_REGISTERS = 57
 
 
 def parse_registers(
-    registers: List[int], topic: str
+    registers: List[int], topic: str, protocol: int = 0
 ) -> Dict[str, Union[int, float, bool, str, list]]:
     """Parse device registers based on topic and return structured data.
+
+    ``protocol`` selects the register profile: 0 is the V0 document, 1 the
+    V1 layout of newer stations (see ``registers_v1``), detected from a
+    holding-register frame with ``detect_protocol``.
 
     The response payload carries the requested registers followed by the
     frame's CRC word, so ``registers`` is one entry longer than the requested
@@ -319,9 +327,13 @@ def parse_registers(
         return {}
 
     if 'device/response/client/04' in topic:
+        if protocol == PROTOCOL_V1:
+            return decode_input_registers_v1(registers)
         return decode_input_registers(registers)
 
     if 'device/response/client/data' in topic:
+        if protocol == PROTOCOL_V1:
+            return decode_holding_registers_v1(registers)
         return decode_holding_registers(registers)
 
     # Unrecognised topic: the same register numbers mean different things in
