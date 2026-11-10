@@ -225,3 +225,43 @@ def decode_holding_registers_v1(registers: List[int]) -> Dict[str, Any]:
         _set(out, "%sSoftware" % key, _map(reg(index), decode_v1_version))
 
     return out
+
+
+# ---------------------------------------------------------------------------
+# Writes (V1)
+#
+# The app writes with a frame the V0 document does not have:
+#   [addr, func, reg, 0x00, 0x01, value_hi, value_lo, crc_hi, crc_lo]
+# func 6 for a holding register, func 5 for the state word (input 75): the
+# app reads the current word, flips one bit and writes the whole word back.
+# ---------------------------------------------------------------------------
+
+FUNC_WRITE_HOLDING = 6
+FUNC_WRITE_STATE = 5
+
+# bits of input 75 the integration is allowed to flip
+STATE_SWITCH_BITS: Dict[str, int] = {
+    "acOutput": 4,            # AC_BackUp_Output_KEY_onoff
+    "acSilentCharging": 6,    # silent_charging_mode
+    "buzzerEnabled": 7,       # Buzzer_enable
+    "dcPortOutput": 11,       # DC_usb_pd_led_wirelesscharge_Port_Out_onoff
+}
+
+# (func, register) -> allowed values; ranges follow the V0 document's limits
+# for the same settings (the app bundle gives no ranges)
+WRITABLE_REGISTERS_V1: Dict[tuple, range] = {
+    (FUNC_WRITE_STATE, IREG_V1_SYSTEM_STATE): range(0, 0x10000),
+    (FUNC_WRITE_HOLDING, HREG_V1_DC_INPUT_CURRENT_SET): range(1, 21),
+    (FUNC_WRITE_HOLDING, HREG_V1_AC_SLEEP_TIME): range(0, 5001),
+    (FUNC_WRITE_HOLDING, HREG_V1_LCD_DIM_TIME): range(0, 5001),
+    (FUNC_WRITE_HOLDING, HREG_V1_DISCHARGE_SOC_MIN): range(0, 501),
+    (FUNC_WRITE_HOLDING, HREG_V1_CHARGE_SOC_MAX): range(600, 1001),
+    (FUNC_WRITE_HOLDING, HREG_V1_SHUTDOWN_WAIT_TIME): range(0, 5001),
+    (FUNC_WRITE_HOLDING, HREG_V1_USB_SLEEP_TIME): range(0, 5001),
+    (FUNC_WRITE_HOLDING, HREG_V1_DC_SLEEP_TIME): range(0, 5001),
+}
+
+
+def state_word_with_bit(current: int, bit: int, on: bool) -> int:
+    """Return the state word with one bit set or cleared, all others kept."""
+    return (current | (1 << bit)) if on else (current & ~(1 << bit) & 0xFFFF)

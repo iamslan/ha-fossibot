@@ -128,3 +128,48 @@ def test_parse_registers_routes_by_profile():
 def test_soc_low_seven_bits(raw, expected):
     from fossibot_ha.sydpower.registers_v1 import decode_v1_soc
     assert decode_v1_soc(raw) == expected
+
+
+# --- writes -----------------------------------------------------------------
+
+from fossibot_ha.sydpower.modbus import ModbusValidationError, get_write_modbus_v1, ta
+from fossibot_ha.sydpower.registers_v1 import (
+    FUNC_WRITE_HOLDING, FUNC_WRITE_STATE, HREG_V1_DISCHARGE_SOC_MIN,
+    IREG_V1_SYSTEM_STATE, STATE_SWITCH_BITS, state_word_with_bit,
+)
+
+
+def test_state_word_bit_flip_keeps_other_bits():
+    word = 0x1898                                   # captured: AC on, DC/USB on, buzzer on
+    assert state_word_with_bit(word, STATE_SWITCH_BITS["acOutput"], False) == 0x1888
+    assert state_word_with_bit(0x1888, STATE_SWITCH_BITS["acOutput"], True) == 0x1898
+    assert state_word_with_bit(word, STATE_SWITCH_BITS["buzzerEnabled"], False) == 0x1818
+    assert state_word_with_bit(0xFFFF, 4, False) == 0xFFEF
+
+
+def test_v1_state_write_frame_matches_app_layout():
+    # [addr, func, reg, count_hi, count_lo, value_hi, value_lo, crc_hi, crc_lo]
+    frame = get_write_modbus_v1(0x11, FUNC_WRITE_STATE, IREG_V1_SYSTEM_STATE, 0x1888)
+    assert frame[:7] == [0x11, 0x05, 0x4B, 0x00, 0x01, 0x18, 0x88]
+    assert len(frame) == 9
+    crc = ta(frame[:7])
+    assert frame[7:] == [(crc >> 8) & 0xFF, crc & 0xFF]
+
+
+def test_v1_holding_write_frame():
+    frame = get_write_modbus_v1(0x11, FUNC_WRITE_HOLDING, HREG_V1_DISCHARGE_SOC_MIN, 100)
+    assert frame[:7] == [0x11, 0x06, 0x1A, 0x00, 0x01, 0x00, 0x64]
+
+
+@pytest.mark.parametrize("func,register,value", [
+    (FUNC_WRITE_HOLDING, HREG_V1_DISCHARGE_SOC_MIN, 501),   # above the 50 % floor limit
+    (FUNC_WRITE_HOLDING, 27, 599),                          # below the 60 % ceiling limit
+    (FUNC_WRITE_HOLDING, 24, 5001),
+    (FUNC_WRITE_HOLDING, 7, 1),                             # protocol version: never
+    (FUNC_WRITE_HOLDING, 0, 1),                             # factory reset: never
+    (FUNC_WRITE_STATE, 53, 0),                              # only the state word is writable
+    (FUNC_WRITE_STATE, IREG_V1_SYSTEM_STATE, 0x10000),
+])
+def test_v1_write_refusals(func, register, value):
+    with pytest.raises(ModbusValidationError):
+        get_write_modbus_v1(0x11, func, register, value)

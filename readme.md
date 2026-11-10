@@ -55,7 +55,7 @@ platform and should work:
 
 | Brand | Models |
 |-------|--------|
-| **FOSSiBOT** | F1200, F2400, F3600, F3600 Pro, F7200 (protocol V1, sensors only — see below) |
+| **FOSSiBOT** | F1200, F2400, F3600, F3600 Pro, F7200 (protocol V1 — see below) |
 | **AFERIY** | P210, P310 |
 | **Eco Play (ECOPLAY)** | SYD2400, SYD3600, 3600 Pro |
 | **ABOK Power** | Ark3600 |
@@ -329,9 +329,13 @@ Newer stations report protocol version 1 in holding register 7 and use a
 different register layout (`sydpower/registers_v1.py`, indices taken from the
 BrightEMS app bundle). The integration detects this from the first settings
 frame and decodes with the V1 table: inputs, SoC, state bits, timers and the
-PV energy counters. Outputs on V1 are bits of input register 75 rather than
-holding registers 24-26, and the write path is not implemented yet, so such a
-device gets sensors and binary sensors only — no switches, selects or numbers.
+PV energy counters. Writes use the V1 frame the app sends
+(`[addr, func, reg, 0, 1, hi, lo, crc]`): outputs and modes are bits of the
+state word (input register 75, function 5, read-modify-write of the whole
+word), settings are holding registers (function 6). V1 devices get switches
+for AC Output, DC & USB Output, AC Silent Charging and Buzzer, and numbers
+for the charge/discharge limits, DC input current and the standby timers.
+The LED, charge-level and DC-input-type selects are not mapped yet.
 
 ## Not supported
 

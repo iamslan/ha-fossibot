@@ -33,8 +33,8 @@ from .const import (
 )
 from .registers import decode_holding_registers, decode_input_registers
 from .registers_v1 import (
-    PROTOCOL_V1, decode_holding_registers_v1, decode_input_registers_v1,
-    detect_protocol,
+    PROTOCOL_V1, WRITABLE_REGISTERS_V1, decode_holding_registers_v1,
+    decode_input_registers_v1, detect_protocol,
 )
 
 
@@ -239,6 +239,26 @@ def get_write_modbus(address: int, feature: int, value: int) -> List[int]:
         )
     a = int_to_high_low(value)
     return aa(address, feature, [a['high'], a['low']], False)
+
+
+def get_write_modbus_v1(address: int, func: int, register: int, value: int) -> List[int]:
+    """Encode a validated V1 write (func 6 holding register, func 5 state word).
+
+    Frame as the BrightEMS app builds it for protocol_version >= 1:
+    ``[addr, func, reg, count_hi, count_lo, value_hi, value_lo]`` + CRC.
+    """
+    allowed = WRITABLE_REGISTERS_V1.get((func, register))
+    if allowed is None:
+        raise ModbusValidationError(
+            "V1 func %d register %d is not writable by this integration" % (func, register)
+        )
+    if value not in allowed:
+        raise ModbusValidationError(
+            "Value %d is not allowed for V1 func %d register %d (%d..%d)"
+            % (value, func, register, allowed.start, allowed.stop - 1)
+        )
+    v = int_to_high_low(value)
+    return sa(address, func, [register & 0xFF, 0x00, 0x01, v['high'], v['low']], False)
 
 
 def pack_byte_pair(high: int, low: int) -> int:
