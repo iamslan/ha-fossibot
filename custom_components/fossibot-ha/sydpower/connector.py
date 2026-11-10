@@ -13,8 +13,9 @@ from .modbus import (
     REGEnableACOutput, REGDisableLED, REGEnableLEDAlways,
     REGEnableLEDSOS, REGEnableLEDFlash, REGDisableACSilentChg,
     REGEnableACSilentChg, get_read_modbus, get_read_input_modbus,
-    get_write_modbus, ModbusValidationError,
+    get_write_modbus, get_write_modbus_v1, ModbusValidationError,
 )
+from .registers_v1 import HREG_V1_DC_INPUT_CURRENT_SET
 from .const import (
     REGISTER_MODBUS_ADDRESS, REGISTER_MAXIMUM_CHARGING_CURRENT,
     DEFAULT_MQTT_PORT, MODBUS_READ_COUNT, MODBUS_MAX_READ_COUNT,
@@ -507,6 +508,34 @@ class SydpowerConnector:
             try:
                 command_bytes = get_write_modbus(
                     modbus_addr, register, reg_value,
+                )
+            except ModbusValidationError as e:
+                self._logger.error("Refused to write: %s", e)
+                return False
+        elif command == "write_v1" and value is not None:
+            # protocol V1 devices: (func, register, value), see registers_v1
+            func, register, reg_value = value
+            device_info = self.devices.get(device_id, {})
+            modbus_addr = device_info.get(
+                "_modbus_address", REGISTER_MODBUS_ADDRESS
+            )
+            if device_info.get("protocolProfile") != 1:
+                self._logger.error(
+                    "Refused V1 write to %s: device is not on profile V1", device_id
+                )
+                return False
+            if func == 6 and register == HREG_V1_DC_INPUT_CURRENT_SET:
+                device_max = device_info.get("dcInputMaxCurrent")
+                if isinstance(device_max, int) and 0 < device_max < reg_value:
+                    self._logger.error(
+                        "Refused to write %d A to V1 register %d: device reports "
+                        "a maximum DC charging current of %d A",
+                        reg_value, register, device_max,
+                    )
+                    return False
+            try:
+                command_bytes = get_write_modbus_v1(
+                    modbus_addr, func, register, reg_value,
                 )
             except ModbusValidationError as e:
                 self._logger.error("Refused to write: %s", e)

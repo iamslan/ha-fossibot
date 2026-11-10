@@ -10,7 +10,10 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .coordinator import FossibotDataUpdateCoordinator
-from .entity import FossibotEntity
+from .entity import FossibotEntity, device_profile
+from .sydpower.registers_v1 import (
+    FUNC_WRITE_STATE, IREG_V1_SYSTEM_STATE, STATE_SWITCH_BITS, state_word_with_bit,
+)
 from .sydpower.modbus import pack_byte_pair, NOT_SET
 from .sydpower.const import (
     HREG_APP_CONTROL_SLEEP,
@@ -67,6 +70,15 @@ REGISTER_SWITCH_DEFINITIONS = [
     },
 ]
 
+# Protocol V1: one switch per allowed bit of the state word. Keys match the
+# V1 decoder so the state comes straight from the last input frame.
+V1_STATE_SWITCH_DEFINITIONS = [
+    {"name": "AC Output", "key": "acOutput"},
+    {"name": "DC & USB Output", "key": "dcPortOutput"},
+    {"name": "AC Silent Charging", "key": "acSilentCharging", "category": EntityCategory.CONFIG},
+    {"name": "Buzzer", "key": "buzzerEnabled", "category": EntityCategory.CONFIG},
+]
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -78,6 +90,13 @@ async def async_setup_entry(
 
     entities: list[SwitchEntity] = []
     for device_id in coordinator.data:
+        if device_profile(coordinator, device_id) != 0:
+            # V1: outputs and modes are bits of the state word (input 75)
+            entities.extend(
+                FossibotV1StateSwitch(coordinator, device_id, **defn)
+                for defn in V1_STATE_SWITCH_DEFINITIONS
+            )
+            continue
         entities.extend(
             FossibotSwitch(coordinator, device_id, **defn)
             for defn in SWITCH_DEFINITIONS
@@ -181,3 +200,35 @@ class FossibotRegisterSwitch(_FossibotSwitchBase):
     async def async_turn_off(self, **kwargs):
         """Turn the switch off."""
         await self._write(self._off_value)
+
+
+class FossibotV1StateSwitch(_FossibotSwitchBase):
+    """Protocol V1: flips one bit of the state word and writes it back.
+
+    Mirrors the app: read the last reported word (input 75), change the one
+    bit, write the whole word with function 5. Other bits are preserved as
+    last seen, so a change made elsewhere between the poll and the write is
+    overwritten the same way it would be by the app.
+    """
+
+    def __init__(self, coordinator, device_id: str, name: str, key: str,
+                 category: EntityCategory | None = None) -> None:
+        super().__init__(coordinator, device_id, name, key, category)
+        self._bit = STATE_SWITCH_BITS[key]
+
+    async def _write(self, on: bool) -> None:
+        current = self.coordinator.data.get(self._device_id, {}).get("systemStateRaw")
+        if current is None:
+            _LOGGER.error("No state word known for %s yet, not writing", self._device_id)
+            return
+        word = state_word_with_bit(current, self._bit, on)
+        await self.coordinator.connector.run_command(
+            self._device_id, "write_v1", (FUNC_WRITE_STATE, IREG_V1_SYSTEM_STATE, word)
+        )
+        await self.coordinator.async_request_refresh()
+
+    async def async_turn_on(self, **kwargs):
+        await self._write(True)
+
+    async def async_turn_off(self, **kwargs):
+        await self._write(False)

@@ -18,7 +18,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .coordinator import FossibotDataUpdateCoordinator
-from .entity import FossibotEntity
+from .entity import FossibotEntity, definitions_for, device_profile
 
 DIAGNOSTIC = EntityCategory.DIAGNOSTIC
 
@@ -32,7 +32,11 @@ BINARY_SENSOR_DEFINITIONS = [
     # be present while the unit runs off-grid.
     {"name": "Grid Input Present", "key": "gridVoltagePresent",
      "device_class": BinarySensorDeviceClass.PLUG},  # bit 19
-    {"name": "On Grid", "key": "gridConnected"},  # bit 17
+    {"name": "On Grid", "key": "gridConnected", "profile": 0},  # bit 17
+    {"name": "Grid Discharging", "key": "gridDischarging", "profile": 1},  # V1 input 53 bit 7
+    {"name": "PV Self-Consumption", "key": "pvSelfConsumption", "profile": 1},  # V1 input 75 bit 0
+    {"name": "Grid Feed Paused", "key": "gridFunctionPause", "profile": 1},  # V1 input 75 bit 1
+    {"name": "AI Energy Control", "key": "aiEnergyControl", "profile": 1},  # V1 input 75 bit 3
     {"name": "DC Charging", "key": "dcCharging",
      "device_class": BinarySensorDeviceClass.BATTERY_CHARGING},  # bit 22
     {"name": "DC Input Present", "key": "dcChargeVoltagePresent",
@@ -131,7 +135,8 @@ async def async_setup_entry(
     entities = [
         FossibotBinarySensor(coordinator, device_id, **defn)
         for device_id in coordinator.data
-        for defn in BINARY_SENSOR_DEFINITIONS
+        for defn in definitions_for(
+            BINARY_SENSOR_DEFINITIONS, device_profile(coordinator, device_id))
     ]
 
     async_add_entities(entities)

@@ -16,6 +16,23 @@ _VERSION_FIELDS = (
 )
 
 
+def device_profile(coordinator, device_id: str) -> int:
+    """Register profile of a device: 0 = V0 document, 1 = V1 (registers_v1)."""
+    return coordinator.data.get(device_id, {}).get("protocolProfile", 0)
+
+
+def definitions_for(definitions, profile: int):
+    """Yield entity definitions that apply to ``profile``, minus the marker key.
+
+    A definition without ``profile`` applies to every device; ``profile: 0``
+    or ``profile: 1`` restricts it to that register layout.
+    """
+    for defn in definitions:
+        wanted = defn.get("profile")
+        if wanted is None or wanted == profile:
+            yield {k: v for k, v in defn.items() if k != "profile"}
+
+
 class FossibotEntity(CoordinatorEntity):
     """Base class for all Fossibot entities.
 

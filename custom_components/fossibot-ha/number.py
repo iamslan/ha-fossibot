@@ -10,7 +10,12 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .coordinator import FossibotDataUpdateCoordinator
-from .entity import FossibotEntity
+from .entity import FossibotEntity, device_profile
+from .sydpower.registers_v1 import (
+    FUNC_WRITE_HOLDING, HREG_V1_AC_SLEEP_TIME, HREG_V1_CHARGE_SOC_MAX,
+    HREG_V1_DC_INPUT_CURRENT_SET, HREG_V1_DC_SLEEP_TIME, HREG_V1_DISCHARGE_SOC_MIN,
+    HREG_V1_LCD_DIM_TIME, HREG_V1_SHUTDOWN_WAIT_TIME, HREG_V1_USB_SLEEP_TIME,
+)
 from .sydpower.modbus import NOT_SET, pack_byte_pair
 from .sydpower.const import (
     HREG_LOW_BATTERY_NOTIFY,
@@ -117,6 +122,36 @@ NUMBER_DEFINITIONS = [
     },
 ]
 
+# Protocol V1 holding registers (registers_v1); written with func 6 through
+# the connector's write_v1 command, ranges from WRITABLE_REGISTERS_V1.
+V1_NUMBER_DEFINITIONS = [
+    {"name": "DC Input Charging Current Limit", "key": "maximumChargingCurrent",
+     "register": HREG_V1_DC_INPUT_CURRENT_SET, "min_value": 1, "max_value": 20, "step": 1,
+     "unit": "A", "mode": NumberMode.SLIDER, "multiplier": 1, "max_from_key": "dcInputMaxCurrent",
+     "category": EntityCategory.CONFIG},
+    {"name": "Discharge Lower Limit", "key": "dischargeLowerLimit",
+     "register": HREG_V1_DISCHARGE_SOC_MIN, "min_value": 0, "max_value": 50, "step": 1,
+     "unit": "%", "mode": NumberMode.SLIDER, "multiplier": 10, "category": EntityCategory.CONFIG},
+    {"name": "AC Charging Upper Limit", "key": "acChargingUpperLimit",
+     "register": HREG_V1_CHARGE_SOC_MAX, "min_value": 60, "max_value": 100, "step": 1,
+     "unit": "%", "mode": NumberMode.SLIDER, "multiplier": 10, "category": EntityCategory.CONFIG},
+    {"name": "Screen Rest Time", "key": "screenRestTime",
+     "register": HREG_V1_LCD_DIM_TIME, "min_value": 0, "max_value": 5000, "step": 1,
+     "unit": "s", "mode": NumberMode.BOX, "multiplier": 1, "category": EntityCategory.CONFIG},
+    {"name": "AC Standby Time", "key": "acStandbyTime",
+     "register": HREG_V1_AC_SLEEP_TIME, "min_value": 0, "max_value": 5000, "step": 1,
+     "unit": "min", "mode": NumberMode.BOX, "multiplier": 1, "category": EntityCategory.CONFIG},
+    {"name": "USB Standby Time", "key": "usbStandbyTime",
+     "register": HREG_V1_USB_SLEEP_TIME, "min_value": 0, "max_value": 5000, "step": 1,
+     "unit": "min", "mode": NumberMode.BOX, "multiplier": 1, "category": EntityCategory.CONFIG},
+    {"name": "DC Standby Time", "key": "dcStandbyTime",
+     "register": HREG_V1_DC_SLEEP_TIME, "min_value": 0, "max_value": 5000, "step": 1,
+     "unit": "min", "mode": NumberMode.BOX, "multiplier": 1, "category": EntityCategory.CONFIG},
+    {"name": "Whole Machine Unused Time", "key": "wholeMachineUnusedTime",
+     "register": HREG_V1_SHUTDOWN_WAIT_TIME, "min_value": 0, "max_value": 5000, "step": 1,
+     "unit": "min", "mode": NumberMode.BOX, "multiplier": 1, "category": EntityCategory.CONFIG},
+]
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -126,11 +161,14 @@ async def async_setup_entry(
     """Set up Fossibot number entities."""
     coordinator = hass.data[DOMAIN][config_entry.entry_id]
 
-    entities = [
-        FossibotNumber(coordinator, device_id, **defn)
-        for device_id in coordinator.data
-        for defn in NUMBER_DEFINITIONS
-    ]
+    entities = []
+    for device_id in coordinator.data:
+        if device_profile(coordinator, device_id) == 0:
+            entities.extend(FossibotNumber(coordinator, device_id, **defn)
+                            for defn in NUMBER_DEFINITIONS)
+        else:
+            entities.extend(FossibotNumber(coordinator, device_id, v1=True, **defn)
+                            for defn in V1_NUMBER_DEFINITIONS)
 
     async_add_entities(entities)
 
@@ -154,9 +192,11 @@ class FossibotNumber(FossibotEntity, NumberEntity):
         category: EntityCategory | None = None,
         max_from_key: str | None = None,
         pack_high: int | None = None,
+        v1: bool = False,
     ) -> None:
         """Initialize the number entity."""
         super().__init__(coordinator, device_id)
+        self._v1 = v1
         self._key = key
         self._register = register
         self._multiplier = multiplier
@@ -197,7 +237,12 @@ class FossibotNumber(FossibotEntity, NumberEntity):
         if self._pack_high is not None:
             reg_value = pack_byte_pair(self._pack_high, reg_value)
 
-        await self.coordinator.connector.run_command(
-            self._device_id, "write_register", (self._register, reg_value)
-        )
+        if self._v1:
+            await self.coordinator.connector.run_command(
+                self._device_id, "write_v1", (FUNC_WRITE_HOLDING, self._register, reg_value)
+            )
+        else:
+            await self.coordinator.connector.run_command(
+                self._device_id, "write_register", (self._register, reg_value)
+            )
         await self.coordinator.async_request_refresh()
