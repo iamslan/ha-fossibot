@@ -12,7 +12,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .coordinator import FossibotDataUpdateCoordinator
-from .entity import FossibotEntity
+from .entity import FossibotEntity, definitions_for, device_profile
 
 # ---------------------------------------------------------------------------
 # Sensor definitions
@@ -54,6 +54,21 @@ SENSOR_DEFINITIONS = [
     {"name": "DC Input", "key": "dcInput", "unit": "W", "device_class": POWER},  # input 04
     {"name": "USB-C Input", "key": "typecInput", "unit": "W", "device_class": POWER},  # input 05
     {"name": "Total Input", "key": "totalInput", "unit": "W", "device_class": POWER},  # input 06
+
+    # V1 profile only (registers_v1): per-string PV, grid feed, DC side, daily PV
+    {"name": "PV 1 Input", "key": "pv1Input", "unit": "W", "device_class": POWER, "profile": 1},  # V1 input 03
+    {"name": "PV 2 Input", "key": "pv2Input", "unit": "W", "device_class": POWER, "profile": 1,
+     "default_enabled": False},  # V1 input 04
+    {"name": "PV 3 Input", "key": "pv3Input", "unit": "W", "device_class": POWER, "profile": 1,
+     "default_enabled": False},  # V1 input 05
+    {"name": "PV 4 Input", "key": "pv4Input", "unit": "W", "device_class": POWER, "profile": 1,
+     "default_enabled": False},  # V1 input 06
+    {"name": "AC Grid Power", "key": "acGridPower", "unit": "W", "device_class": POWER, "profile": 1},  # V1 input 07
+    {"name": "DC Output Power", "key": "dcOutputPower", "unit": "W", "device_class": POWER, "profile": 1},  # V1 input 78
+    {"name": "PV Energy Today", "key": "pvEnergyToday", "unit": "Wh", "device_class": ENERGY,
+     "state_class": SensorStateClass.TOTAL_INCREASING, "profile": 1},  # V1 input 61
+    {"name": "Device Clock", "key": "deviceTime", "unit": None, "device_class": None,
+     "category": DIAGNOSTIC, "default_enabled": False, "profile": 1},  # V1 input 97-99
 
     # --- Output power ----------------------------------------------------
     {"name": "Total Output", "key": "totalOutput", "unit": "W", "device_class": POWER},  # input 39
@@ -165,7 +180,8 @@ async def async_setup_entry(
     entities = [
         FossibotSensor(coordinator, device_id, **defn)
         for device_id in coordinator.data
-        for defn in SENSOR_DEFINITIONS
+        for defn in definitions_for(
+            SENSOR_DEFINITIONS, device_profile(coordinator, device_id))
     ]
 
     async_add_entities(entities)

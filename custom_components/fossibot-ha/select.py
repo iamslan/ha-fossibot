@@ -11,7 +11,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .coordinator import FossibotDataUpdateCoordinator
-from .entity import FossibotEntity
+from .entity import FossibotEntity, device_profile
 from .sydpower.const import (
     HREG_AC_CHARGE_LEVEL,
     HREG_DC_INPUT_TYPE,
@@ -121,6 +121,7 @@ async def async_setup_entry(
     entities = [
         FossibotRegisterSelect(coordinator, device_id, **defn)
         for device_id in coordinator.data
+        if device_profile(coordinator, device_id) == 0  # V0 holding registers only
         for defn in SELECT_DEFINITIONS
     ]
 

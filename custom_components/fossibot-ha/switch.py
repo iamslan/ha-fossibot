@@ -10,7 +10,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .coordinator import FossibotDataUpdateCoordinator
-from .entity import FossibotEntity
+from .entity import FossibotEntity, device_profile
 from .sydpower.modbus import pack_byte_pair, NOT_SET
 from .sydpower.const import (
     HREG_APP_CONTROL_SLEEP,
@@ -78,6 +78,9 @@ async def async_setup_entry(
 
     entities: list[SwitchEntity] = []
     for device_id in coordinator.data:
+        if device_profile(coordinator, device_id) != 0:
+            # V1 outputs are bits of input 75, not holding 24-26: no writes yet
+            continue
         entities.extend(
             FossibotSwitch(coordinator, device_id, **defn)
             for defn in SWITCH_DEFINITIONS
