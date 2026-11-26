@@ -43,10 +43,14 @@ report issues, or share results for your model.
 |---|---|
 | **BrightEMS app** | version **1.6.0** or later |
 | **MQTT broker** | e.g. [Mosquitto](https://mosquitto.org/) or [EMQX](https://www.emqx.io/), reachable **by your power station** on TCP port 1883 |
-| **Internet** | needed once at startup for the device list, and for online/offline state sync — the telemetry itself is local |
+| **Internet** | needed for initial device discovery and optional online/offline state sync; saved device identities allow later local starts without the cloud |
 
 The broker must be reachable from the power station, not just from Home
 Assistant. The device connects to it directly.
+
+After the first successful discovery, Home Assistant stores only device identities,
+names and Modbus addressing locally. This cache contains no API token or sensor
+readings. Reconnecting to the broker does not require another cloud discovery.
 
 ## Supported devices
 

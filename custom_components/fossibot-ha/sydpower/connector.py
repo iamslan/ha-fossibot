@@ -2,22 +2,35 @@
 
 import asyncio
 import time
-from typing import Any, Dict, Optional
 
 from .logger import SmartLogger
 from .api_client import APIClient
 from .mqtt_client import MQTTClient
 from .modbus import (
-    REGRequestSettings, REGDisableUSBOutput, REGEnableUSBOutput,
-    REGDisableDCOutput, REGEnableDCOutput, REGDisableACOutput,
-    REGEnableACOutput, REGDisableLED, REGEnableLEDAlways,
-    REGEnableLEDSOS, REGEnableLEDFlash, REGDisableACSilentChg,
-    REGEnableACSilentChg, get_read_modbus, get_read_input_modbus,
-    get_write_modbus, ModbusValidationError,
+    REGRequestSettings,
+    REGDisableUSBOutput,
+    REGEnableUSBOutput,
+    REGDisableDCOutput,
+    REGEnableDCOutput,
+    REGDisableACOutput,
+    REGEnableACOutput,
+    REGDisableLED,
+    REGEnableLEDAlways,
+    REGEnableLEDSOS,
+    REGEnableLEDFlash,
+    REGDisableACSilentChg,
+    REGEnableACSilentChg,
+    get_read_modbus,
+    get_read_input_modbus,
+    get_write_modbus,
+    ModbusValidationError,
 )
 from .const import (
-    REGISTER_MODBUS_ADDRESS, REGISTER_MAXIMUM_CHARGING_CURRENT,
-    DEFAULT_MQTT_PORT, MODBUS_READ_COUNT, MODBUS_MAX_READ_COUNT,
+    REGISTER_MODBUS_ADDRESS,
+    REGISTER_MAXIMUM_CHARGING_CURRENT,
+    DEFAULT_MQTT_PORT,
+    MODBUS_READ_COUNT,
+    MODBUS_MAX_READ_COUNT,
 )
 
 COMMANDS = {
@@ -38,372 +51,222 @@ COMMANDS = {
 
 
 class SydpowerConnector:
-    """Main class for Fossibot/Sydpower connection via local MQTT broker."""
+    """Keep broker transport separate from fresh power-station telemetry."""
 
     def __init__(
-        self,
-        api_token: str,
-        mqtt_host: str,
-        mqtt_port: int = DEFAULT_MQTT_PORT,
-        mqtt_username: str = "",
+        self, api_token, mqtt_host, mqtt_port=DEFAULT_MQTT_PORT, mqtt_username=""
     ):
         self.api_token = api_token
         self.mqtt_host = mqtt_host
         self.mqtt_port = mqtt_port
         self.mqtt_username = mqtt_username
         self._logger = SmartLogger(__name__)
-
-        self.api_client: Optional[APIClient] = None
-        self.mqtt_client: Optional[MQTTClient] = None
-        self.loop: Optional[asyncio.AbstractEventLoop] = None
-
-        # Connection management
+        self.api_client = None
+        self.mqtt_client = None
+        self.loop = None
+        self.devices = {}
+        self.on_device_list = None
+        self.on_device_available = None
         self._connection_lock = asyncio.Lock()
-        self._reconnection_in_progress = False
-        self._reconnection_event = asyncio.Event()
-        self._reconnection_event.set()
-        self._last_reconnection_attempt = 0
-        self._min_reconnection_interval = 5
-
-        # Device data
-        self.devices: Dict[str, Any] = {}
-
-        # Last successful connection timestamp
+        self._io_lock = asyncio.Lock()
+        self._reconnect_task = None
+        self._background_tasks = set()
+        self._online_announced = set()
+        self._closing = False
         self._last_successful_communication = 0
 
-    async def connect(self) -> bool:
-        """Connect to the API and local MQTT broker. Returns True if successful."""
-        if self._reconnection_in_progress:
-            self._logger.debug(
-                "Connection attempt while reconnection in progress, waiting..."
-            )
-            try:
-                await asyncio.wait_for(
-                    self._reconnection_event.wait(), timeout=15.0
-                )
-            except asyncio.TimeoutError:
-                self._logger.error("Timeout waiting for reconnection")
-                return False
-
-            if self.mqtt_client and self.mqtt_client.connected.is_set():
-                return True
-
-        # Already connected
-        if self.mqtt_client and self.mqtt_client.connected.is_set():
-            return True
-
-        # Acquire lock to prevent concurrent connection attempts
-        try:
-            lock_acquired = await asyncio.wait_for(
-                self._connection_lock.acquire(), timeout=10.0
-            )
-        except asyncio.TimeoutError:
-            self._logger.error("Timeout acquiring connection lock")
-            return False
-
-        if not lock_acquired:
-            return False
-
-        try:
-            if self.loop is None:
-                self.loop = asyncio.get_running_loop()
-
-            if self.api_client is None:
-                self.api_client = APIClient(self.api_token)
-
-            if self.mqtt_client is None:
-                self.mqtt_client = MQTTClient(self.loop)
-                self.mqtt_client.on_disconnect_callback = (
-                    self._handle_mqtt_disconnect
-                )
-                self.mqtt_client.on_device_state_callback = (
-                    self._handle_device_state
-                )
-
-            # Step 1: Get device list from API
-            self._logger.info("Getting device list from API")
-            self.devices = await asyncio.wait_for(
-                self.api_client.get_devices(), timeout=15.0
-            )
-
-            device_ids = list(self.devices.keys())
-
-            if not device_ids:
-                self._logger.error("No devices returned from API")
-                raise ValueError("No devices returned from API")
-
-            self._logger.info(
-                "Found %d devices: %s", len(device_ids), device_ids
-            )
-
-            # Step 2: Connect to local MQTT broker
-            self._logger.info(
-                "Connecting to MQTT broker at %s:%d",
-                self.mqtt_host, self.mqtt_port,
-            )
-
-            await self.mqtt_client.connect(
-                device_ids, self.mqtt_host, self.mqtt_port, self.mqtt_username
-            )
-
-            try:
-                await asyncio.wait_for(
-                    self.mqtt_client.connected.wait(), timeout=15.0
-                )
-            except asyncio.TimeoutError:
-                self._logger.error("Timeout waiting for MQTT connection")
-                await self._cleanup()
-                return False
-
-            # Step 3: Verify connection (get initial data)
-            try:
-                if await asyncio.wait_for(
-                    self._verify_connection(), timeout=15.0
-                ):
-                    self._last_successful_communication = time.time()
-                    self._logger.info(
-                        "Connected to local MQTT broker at %s:%d",
-                        self.mqtt_host, self.mqtt_port,
-                    )
-                    return True
-            except asyncio.TimeoutError:
-                self._logger.warning("Connection verification timed out")
-
-            # Verification failed but broker is connected — device may be
-            # offline/sleeping. Accept the connection; polls will recover.
-            if self.mqtt_client and self.mqtt_client.connected.is_set():
-                self._logger.warning(
-                    "Device not responding — accepting broker connection. "
-                    "Integration will recover when device is reachable.",
-                )
-                self._last_successful_communication = time.time()
-                return True
-
-            self._logger.error("Failed to connect to MQTT broker")
-            await self._cleanup()
-            return False
-
-        except asyncio.CancelledError:
-            self._logger.warning("Connect operation was cancelled")
-            raise
-        except Exception as e:
-            self._logger.error("Error during connection: %s", e)
-            await self._cleanup()
-            return False
-        finally:
-            if self._connection_lock.locked():
-                self._connection_lock.release()
-
-    async def _verify_connection(self) -> bool:
-        """Verify the connection by testing device responsiveness."""
-        if not self.mqtt_client or not self.mqtt_client.connected.is_set():
-            return False
-
-        self._logger.debug("Stage 1: waiting for initial func 03 response...")
-
-        try:
-            await asyncio.wait_for(
-                self.mqtt_client.data_updated.wait(), timeout=5.0
-            )
-            self._logger.debug(
-                "Initial response received, waiting 1s for settings..."
-            )
-            await asyncio.sleep(1.0)
-
-            if self.mqtt_client.devices:
-                for mac, fields in self.mqtt_client.devices.items():
-                    if mac in self.devices:
-                        self.devices[mac].update(fields)
-                    else:
-                        self.devices[mac] = fields
-
-            field_count = sum(
-                len(v) for v in self.mqtt_client.devices.values()
-            ) if self.mqtt_client.devices else 0
-
-            for mac, fields in (self.mqtt_client.devices or {}).items():
-                self._logger.debug(
-                    "Verify stage 1: %s returned %d fields — %s",
-                    mac, len(fields), sorted(fields.keys()),
-                )
-
-            if field_count == 0:
-                self._logger.warning("Stage 1 received no fields, failing")
-                return False
-
-            self._logger.debug(
-                "Stage 1 complete: %d fields. Starting stage 2 (fresh poll)...",
-                field_count,
-            )
-
-            # Stage 2: Fresh poll
-            self.mqtt_client.clear_message_cache()
-            self.mqtt_client.data_updated.clear()
-
-            for device_mac in list(self.devices.keys()):
-                self._send_read_request(device_mac)
-
-            await asyncio.wait_for(
-                self.mqtt_client.data_updated.wait(), timeout=5.0
-            )
-            await asyncio.sleep(1.0)
-
-            fresh_field_count = sum(
-                len(v) for v in self.mqtt_client.devices.values()
-            ) if self.mqtt_client.devices else 0
-
-            if fresh_field_count == 0:
-                self._logger.warning(
-                    "Stage 2 failed: device did not respond to fresh poll"
-                )
-                return False
-
-            self._logger.info(
-                "Connection verified — stage 1: %d fields, stage 2: %d fields",
-                field_count, fresh_field_count,
-            )
-            return True
-
-        except asyncio.TimeoutError:
-            self._logger.warning(
-                "Connection verification timed out (device not responding)"
-            )
-            return False
-        except Exception as e:
-            self._logger.error("Error during connection verification: %s", e)
-            return False
-
-    async def _handle_device_state(self, device_mac: str, online: bool):
-        """Handle device state changes — sync with platform API."""
-        # Look up the raw device_id (with colons) for the API call
-        device_info = self.devices.get(device_mac, {})
-        raw_device_id = device_info.get("_raw_device_id")
-
-        if not raw_device_id:
-            # Reconstruct MAC with colons from the stripped version
-            if len(device_mac) == 12:
-                raw_device_id = ":".join(
-                    device_mac[i:i+2] for i in range(0, 12, 2)
-                )
-            else:
-                self._logger.warning(
-                    "Cannot determine raw device_id for %s", device_mac
-                )
-                return
-
-        if self.api_client:
-            await self.api_client.update_mqtt_state(raw_device_id, online)
-
-    async def get_data(self) -> Dict[str, Any]:
-        """Get the latest data from devices."""
-        # Wait for any in-progress reconnection
-        if self._reconnection_in_progress:
-            self._logger.debug(
-                "Reconnection in progress, waiting before getting data..."
-            )
-            try:
-                await asyncio.wait_for(
-                    self._reconnection_event.wait(), timeout=30.0
-                )
-            except asyncio.TimeoutError:
-                self._logger.warning("Timeout waiting for reconnection")
-                return {}
-
-        # Ensure connected
-        if not self.mqtt_client or not self.mqtt_client.connected.is_set():
-            self._logger.debug("MQTT client not connected, calling connect()")
-            try:
-                if not await asyncio.wait_for(self.connect(), timeout=30.0):
-                    self._logger.error("Failed to connect")
-                    return {}
-            except asyncio.TimeoutError:
-                self._logger.error("Connection timeout")
-                return {}
-            except Exception as e:
-                self._logger.error("Connection error: %s", e)
-                return {}
-
-        if not self.devices:
-            self._logger.warning("No devices available to request data from")
-            return {}
-
-        data = await self._poll_devices()
-        if data:
-            return data
-
-        # Poll timed out — return cached data so the coordinator stays alive
-        if self.devices:
-            cached_fields = {
-                mac: len([k for k in d if not k.startswith("_")])
-                for mac, d in self.devices.items()
-                if isinstance(d, dict)
+    @staticmethod
+    def device_descriptors(devices):
+        """Persist identity and protocol addressing only, never measurements."""
+        result = {}
+        if not isinstance(devices, dict):
+            return result
+        for mac, record in devices.items():
+            if (
+                not isinstance(mac, str)
+                or len(mac) != 12
+                or any(c not in "0123456789abcdefABCDEF" for c in mac)
+                or not isinstance(record, dict)
+            ):
+                continue
+            address = record.get("_modbus_address", REGISTER_MODBUS_ADDRESS)
+            count = record.get("_modbus_count", MODBUS_READ_COUNT)
+            if (
+                type(address) is not int
+                or not 1 <= address <= 247
+                or type(count) is not int
+                or count < 57
+            ):
+                continue
+            count = min(count, MODBUS_MAX_READ_COUNT)
+            result[mac] = {
+                "_modbus_address": address,
+                "_modbus_count": count,
+                "_raw_device_id": ":".join(mac[i : i + 2] for i in range(0, 12, 2)),
             }
-            self._logger.warning(
-                "Poll timed out, returning cached data: %s", cached_fields
-            )
-            return self.devices
+            raw_id = record.get("_raw_device_id")
+            if (
+                isinstance(raw_id, str)
+                and raw_id.replace(":", "").lower() == mac.lower()
+            ):
+                result[mac]["_raw_device_id"] = raw_id
+            name = record.get("device_name")
+            if isinstance(name, str):
+                result[mac]["device_name"] = name
+            product = record.get("productInfo")
+            if isinstance(product, dict):
+                result[mac]["productInfo"] = {
+                    key: product[key]
+                    for key in ("product_name", "model", "device_model")
+                    if isinstance(product.get(key), (str, int))
+                }
+        return result
 
-        self._logger.warning("Poll timed out and no cached data available")
-        return {}
-
-    async def _poll_devices(self) -> Dict[str, Any]:
-        """Send func 03 and func 04 reads and wait for settings + sensor responses."""
-        if not self.mqtt_client:
-            return {}
-
-        updated = False
-        for func in (3, 4):
-            self.mqtt_client.clear_message_cache()
-            self.mqtt_client.data_updated.clear()
-            self._logger.debug(
-                "Poll: cache cleared, sending func %d to %s",
-                func, list(self.devices.keys()),
-            )
-
-            for device_mac in self.devices:
-                if not self.mqtt_client:
-                    return {}
-                self._send_read_request(device_mac, func)
-
+    async def connect(self):
+        """Serialize broker setup; an offline device does not invalidate it."""
+        async with self._connection_lock:
+            if self._closing:
+                return False
+            if self.is_connected():
+                return True
             try:
+                self.loop = asyncio.get_running_loop()
+                if not self.devices:
+                    if self.api_client is None:
+                        self.api_client = APIClient(self.api_token)
+                    devices = await asyncio.wait_for(
+                        self.api_client.get_devices(), timeout=15
+                    )
+                    descriptors = self.device_descriptors(devices)
+                    if not descriptors:
+                        raise ValueError("No valid device identities available")
+                    self.devices = descriptors
+                    if self.on_device_list:
+                        try:
+                            await self.on_device_list(descriptors)
+                        except Exception as err:
+                            self._logger.warning(
+                                "Cannot persist device identities: %s", err
+                            )
+                await self._cleanup_transport()
+                client = MQTTClient(self.loop)
+                client.on_disconnect_callback = self._handle_mqtt_disconnect
+                client.on_device_state_callback = self._handle_device_state
+                self.mqtt_client = client
                 await asyncio.wait_for(
-                    self.mqtt_client.data_updated.wait(), timeout=5.0
+                    client.connect(
+                        list(self.devices),
+                        self.mqtt_host,
+                        self.mqtt_port,
+                        self.mqtt_username,
+                    ),
+                    timeout=20,
                 )
-                self._logger.debug(
-                    "Poll: first response for func %d arrived, waiting 1s for settings...",
-                    func,
-                )
-                await asyncio.sleep(1.0)
+                return self.is_connected()
+            except asyncio.CancelledError:
+                await self._cleanup_transport()
+                raise
+            except Exception as err:
+                self._logger.warning("Broker connection failed: %s", err)
+                await self._cleanup_transport()
+                return False
 
-                if self.mqtt_client.devices:
-                    self._last_successful_communication = time.time()
-                    for mac, fields in self.mqtt_client.devices.items():
-                        if mac in self.devices:
-                            self.devices[mac].update(fields)
-                        else:
-                            self.devices[mac] = fields
+    def _start_background(self, coroutine):
+        task = asyncio.create_task(coroutine)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_done)
 
-                    for mac in self.devices:
-                        data = self.devices.get(mac, {})
-                        user_fields = [
-                            k for k in data if not k.startswith("_")
-                        ]
-                        self._logger.debug(
-                            "Poll result %s: %d fields — %s",
-                            mac, len(user_fields), sorted(user_fields),
-                        )
-                    updated = True
+    def _background_done(self, task):
+        self._background_tasks.discard(task)
+        if not task.cancelled():
+            error = task.exception()
+            if error:
+                self._logger.debug("Optional cloud state sync failed: %s", error)
 
-            except asyncio.TimeoutError:
-                self._logger.debug(
-                    "Poll: no response within 5s (device may be offline)"
-                )
-            except Exception as e:
-                self._logger.error("Error during poll: %s", e)
+    async def _handle_device_state(self, device_mac, online):
+        if self._closing or device_mac not in self.devices:
+            return
+        # Notify HA before any optional cloud traffic. The callback schedules
+        # a fresh read; an online marker is never accepted as telemetry.
+        if online and self.on_device_available:
+            self.on_device_available()
+        self._schedule_platform_state(device_mac, online)
 
-        if updated:
-            return self.devices
-        return {}
+    def _schedule_platform_state(self, device_mac, online):
+        if online:
+            self._online_announced.add(device_mac)
+        else:
+            self._online_announced.discard(device_mac)
+        if self.api_client is None:
+            self.api_client = APIClient(self.api_token)
+        self._start_background(self._sync_platform_state(device_mac, online))
+
+    async def _sync_platform_state(self, device_mac, online):
+        success = False
+        try:
+            success = await asyncio.wait_for(
+                self.api_client.update_mqtt_state(
+                    self.devices[device_mac]["_raw_device_id"], online
+                ),
+                timeout=10,
+            )
+        finally:
+            # Retry on a later fresh read if optional cloud sync failed.
+            if online and not success:
+                self._online_announced.discard(device_mac)
+
+    async def get_data(self):
+        if not await self.connect():
+            return {}
+        async with self._io_lock:
+            return await self._poll_devices()
+
+    async def _request_responses(self, client, func):
+        # All stations share one response window. An offline station must
+        # not consume the entire coordinator timeout before others are read.
+        events = {}
+        for mac in self.devices:
+            key = (mac, func)
+            event = client.response_events.setdefault(key, asyncio.Event())
+            event.clear()
+            client.responses.pop(key, None)
+            events[mac] = event
+        client.clear_message_cache()
+        for mac in self.devices:
+            self._send_read_request(mac, func)
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(event.wait() for event in events.values())),
+                timeout=5,
+            )
+        except asyncio.TimeoutError:
+            pass
+        return {
+            mac: client.responses[(mac, func)].copy()
+            for mac, event in events.items()
+            if event.is_set() and client.responses.get((mac, func))
+        }
+
+    async def _poll_devices(self):
+        client = self.mqtt_client
+        if not client or not client.connected.is_set():
+            return {}
+        fresh = {}
+        settings = await self._request_responses(client, 3)
+        sensors = await self._request_responses(client, 4)
+        for mac in self.devices:
+            self.devices[mac].update(settings.get(mac, {}))
+            # A settings reply, retained packet or another device's reply
+            # cannot make stale SoC/power available again.
+            if mac in sensors:
+                self.devices[mac].update(sensors[mac])
+                fresh[mac] = self.devices[mac].copy()
+                self._last_successful_communication = time.time()
+                # A non-retained online marker may have been published while
+                # HA was stopped. A fresh input reply is also online evidence.
+                if mac not in self._online_announced:
+                    self._schedule_platform_state(mac, True)
+        return fresh
 
     def _send_read_request(self, device_mac: str, func: int = 3) -> None:
         """Send either Modbus func 03 (holding) or func 04 (input) read using per-device address and count from API."""
@@ -411,9 +274,7 @@ class SydpowerConnector:
             return
 
         device_info = self.devices.get(device_mac, {})
-        modbus_addr = device_info.get(
-            "_modbus_address", REGISTER_MODBUS_ADDRESS
-        )
+        modbus_addr = device_info.get("_modbus_address", REGISTER_MODBUS_ADDRESS)
         modbus_count = device_info.get("_modbus_count", MODBUS_READ_COUNT)
 
         # The protocol caps a single read at 100 words and requires the range
@@ -423,7 +284,9 @@ class SydpowerConnector:
             self._logger.warning(
                 "API reported modbus_count=%d for %s, clamping to protocol "
                 "maximum of %d",
-                modbus_count, device_mac, MODBUS_MAX_READ_COUNT,
+                modbus_count,
+                device_mac,
+                MODBUS_MAX_READ_COUNT,
             )
             modbus_count = MODBUS_MAX_READ_COUNT
 
@@ -433,7 +296,9 @@ class SydpowerConnector:
             self.mqtt_client.publish_command(device_mac, command_bytes_03)
             self._logger.debug(
                 "Sent func 03 to %s (addr=%d, count=%d)",
-                device_mac, modbus_addr, modbus_count,
+                device_mac,
+                modbus_addr,
+                modbus_count,
             )
         elif func == 4:
             # Send func 04 (input registers)
@@ -441,54 +306,32 @@ class SydpowerConnector:
             self.mqtt_client.publish_command(device_mac, command_bytes_04)
             self._logger.debug(
                 "Sent func 04 to %s (addr=%d, count=%d)",
-                device_mac, modbus_addr, modbus_count,
+                device_mac,
+                modbus_addr,
+                modbus_count,
             )
         else:
             self._logger.error("Invalid Modbus func: %d", func)
 
-    async def run_command(
+    async def run_command(self, device_id, command, value=None):
+        if not await self.connect():
+            return False
+        async with self._io_lock:
+            if not self.is_connected() or device_id not in self.devices:
+                return False
+            return await self._run_command_locked(device_id, command, value)
+
+    async def _run_command_locked(
         self, device_id: str, command: str, value=None
     ) -> bool:
         """Run a command on a device. Returns True if successful."""
-        # Wait for reconnection if in progress
-        if self._reconnection_in_progress:
-            self._logger.debug(
-                "Reconnection in progress, waiting before running command..."
-            )
-            try:
-                await asyncio.wait_for(
-                    self._reconnection_event.wait(), timeout=30.0
-                )
-            except asyncio.TimeoutError:
-                self._logger.warning("Timeout waiting for reconnection")
-                return False
-
-        # Ensure connected
-        if not self.mqtt_client or not self.mqtt_client.connected.is_set():
-            try:
-                if not await asyncio.wait_for(self.connect(), timeout=30.0):
-                    self._logger.error(
-                        "Failed to connect for command execution"
-                    )
-                    return False
-            except asyncio.TimeoutError:
-                self._logger.error("Connection timeout for command execution")
-                return False
-            except Exception as e:
-                self._logger.error(
-                    "Connection error for command execution: %s", e
-                )
-                return False
-
         # Resolve command bytes
         if command in COMMANDS:
             command_bytes = COMMANDS[command]
         elif command == "write_register" and value is not None:
             register, reg_value = value
             device_info = self.devices.get(device_id, {})
-            modbus_addr = device_info.get(
-                "_modbus_address", REGISTER_MODBUS_ADDRESS
-            )
+            modbus_addr = device_info.get("_modbus_address", REGISTER_MODBUS_ADDRESS)
 
             # Holding 20 is bounded by holding 17 ("DC Input Max Curr"), which
             # is device-specific and therefore cannot live in the static
@@ -500,13 +343,17 @@ class SydpowerConnector:
                     self._logger.error(
                         "Refused to write %d A to register %d: device reports "
                         "a maximum DC charging current of %d A",
-                        reg_value, register, device_max,
+                        reg_value,
+                        register,
+                        device_max,
                     )
                     return False
 
             try:
                 command_bytes = get_write_modbus(
-                    modbus_addr, register, reg_value,
+                    modbus_addr,
+                    register,
+                    reg_value,
                 )
             except ModbusValidationError as e:
                 self._logger.error("Refused to write: %s", e)
@@ -521,177 +368,62 @@ class SydpowerConnector:
 
         try:
             self._logger.debug("Sending command: %s", command)
-            self.mqtt_client.publish_command(device_id, command_bytes)
-            self._last_successful_communication = time.time()
+            if not self.mqtt_client.publish_command(device_id, command_bytes):
+                return False
             await asyncio.sleep(1)  # Allow device to process
             return True
         except Exception as e:
             self._logger.error("Error publishing command: %s", e)
             return False
 
-    async def reconnect(self) -> bool:
-        """Reconnect to the API and MQTT broker (public API)."""
-        return await self._handle_reconnection()
+    async def reconnect(self):
+        if self._closing:
+            return False
+        if self.is_connected():
+            return True
+        # All callers share one recovery task; cancellation of a poll must
+        # not cancel another caller's broker recovery.
+        if self._reconnect_task is None or self._reconnect_task.done():
+            self._reconnect_task = asyncio.create_task(self._reconnect_loop())
+        return await asyncio.shield(self._reconnect_task)
+
+    async def _reconnect_loop(self):
+        for attempt in range(5):
+            if self._closing:
+                return False
+            if await self.connect():
+                return True
+            if attempt < 4:
+                await asyncio.sleep(min(2**attempt, 15))
+        return False
 
     async def _handle_mqtt_disconnect(self, rc):
-        """Handle MQTT disconnection events."""
-        self._logger.warning("MQTT disconnected with code %s", rc)
-        time_since_last = time.time() - self._last_successful_communication
+        if not self._closing:
+            self._logger.warning("MQTT transport disconnected: %s", rc)
+            await self.reconnect()
 
-        if time_since_last > 60:
-            self._logger.warning(
-                "No successful communication in %.1f seconds, "
-                "forcing reconnection",
-                time_since_last,
-            )
-            self._last_reconnection_attempt = 0
+    async def _cleanup_transport(self):
+        # Polls and writes own the same lock, so cleanup cannot replace their
+        # client halfway through a response or create NoneType races.
+        async with self._io_lock:
+            client, self.mqtt_client = self.mqtt_client, None
+            if client:
+                await client.disconnect()
 
-        self.loop.create_task(self._handle_reconnection())
-
-    async def _handle_reconnection(self):
-        """Handle reconnection with proper backoff and state management."""
-        current_time = time.time()
-
-        if (
-            current_time - self._last_reconnection_attempt
-            < self._min_reconnection_interval
-        ):
-            await asyncio.sleep(self._min_reconnection_interval)
-            current_time = time.time()
-
-        if self._reconnection_in_progress:
-            self._logger.debug(
-                "Reconnection already in progress, waiting..."
-            )
-            try:
-                await asyncio.wait_for(
-                    self._reconnection_event.wait(), timeout=30.0
-                )
-            except asyncio.TimeoutError:
-                self._logger.error(
-                    "Timeout waiting for existing reconnection"
-                )
-            return self.is_connected()
-
-        try:
-            lock_acquired = await asyncio.wait_for(
-                self._connection_lock.acquire(), timeout=10.0
-            )
-        except asyncio.TimeoutError:
-            self._logger.error(
-                "Timeout acquiring connection lock for reconnection"
-            )
-            return False
-
-        if not lock_acquired:
-            return False
-
-        try:
-            self._reconnection_in_progress = True
-            self._reconnection_event.clear()
-            self._last_reconnection_attempt = current_time
-            self._logger.info("Starting reconnection process...")
-
-            try:
-                await asyncio.wait_for(self._cleanup(), timeout=10.0)
-            except asyncio.TimeoutError:
-                self._logger.error("Cleanup timeout during reconnection")
-
-            self.api_client = None
-            self.mqtt_client = None
-            await asyncio.sleep(2)
-
-            max_attempts = 10
-            base_delay = 3
-
-            for attempt in range(max_attempts):
-                self._logger.info(
-                    "Reconnection attempt %d/%d", attempt + 1, max_attempts
-                )
-                try:
-                    if await asyncio.wait_for(self.connect(), timeout=45.0):
-                        self._logger.info(
-                            "Successfully reconnected on attempt %d",
-                            attempt + 1,
-                        )
-                        self._last_successful_communication = time.time()
-                        return True
-                    else:
-                        self._logger.warning(
-                            "Reconnection attempt %d failed verification",
-                            attempt + 1,
-                        )
-                except asyncio.TimeoutError:
-                    self._logger.error(
-                        "Timeout during reconnection attempt %d", attempt + 1
-                    )
-                except Exception as e:
-                    self._logger.error(
-                        "Reconnection attempt %d failed: %s", attempt + 1, e
-                    )
-
-                if attempt < max_attempts - 1:
-                    delay = min(base_delay * (1.5 ** attempt), 30)
-                    self._logger.warning(
-                        "Waiting %.0f seconds before next reconnection attempt",
-                        delay,
-                    )
-                    await asyncio.sleep(delay)
-
-            self._logger.error(
-                "Failed to reconnect after %d attempts", max_attempts
-            )
-            return False
-
-        except asyncio.CancelledError:
-            self._logger.warning("Reconnection process was cancelled")
-            raise
-        except Exception as e:
-            self._logger.error(
-                "Unexpected error in reconnection handler: %s", e
-            )
-            return False
-        finally:
-            self._reconnection_in_progress = False
-            self._reconnection_event.set()
-            if self._connection_lock.locked():
-                self._connection_lock.release()
-
-    async def _cleanup(self) -> None:
-        """Clean up resources."""
-        if self.mqtt_client:
-            try:
-                await asyncio.wait_for(
-                    self.mqtt_client.disconnect(), timeout=5.0
-                )
-            except asyncio.TimeoutError:
-                self._logger.warning("MQTT client disconnect timeout")
-            except Exception as e:
-                self._logger.warning(
-                    "Error during MQTT client cleanup: %s", e
-                )
-            finally:
-                self.mqtt_client = None
-
-        if self.api_client:
-            try:
-                await asyncio.wait_for(
-                    self.api_client.close(), timeout=5.0
-                )
-            except asyncio.TimeoutError:
-                self._logger.warning("API client close timeout")
-            except Exception as e:
-                self._logger.warning(
-                    "Error during API client cleanup: %s", e
-                )
-            finally:
+    async def disconnect(self):
+        self._closing = True
+        tasks = list(self._background_tasks)
+        if self._reconnect_task and not self._reconnect_task.done():
+            tasks.append(self._reconnect_task)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        async with self._connection_lock:
+            await self._cleanup_transport()
+            if self.api_client:
+                await self.api_client.close()
                 self.api_client = None
 
-    async def disconnect(self) -> None:
-        """Disconnect from the API and MQTT broker."""
-        await self._cleanup()
-        self._logger.info("Disconnected from all services")
-
-    def is_connected(self) -> bool:
-        """Check if the connector is connected."""
+    def is_connected(self):
         return bool(self.mqtt_client and self.mqtt_client.connected.is_set())
