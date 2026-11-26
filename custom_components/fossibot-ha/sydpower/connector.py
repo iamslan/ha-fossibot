@@ -72,6 +72,8 @@ class SydpowerConnector:
         self._reconnect_task = None
         self._background_tasks = set()
         self._online_announced = set()
+        self._saved_descriptors = {}
+        self._discovery_refreshed = False
         self._closing = False
         self._last_successful_communication = 0
 
@@ -113,6 +115,11 @@ class SydpowerConnector:
             name = record.get("device_name")
             if isinstance(name, str):
                 result[mac]["device_name"] = name
+            profile = record.get("protocolProfile")
+            if type(profile) is int and profile in (0, 1):
+                # Lets a station that is off at startup get the entity set of
+                # its register layout, and the write guard know it at once.
+                result[mac]["protocolProfile"] = profile
             product = record.get("productInfo")
             if isinstance(product, dict):
                 result[mac]["productInfo"] = {
@@ -121,6 +128,60 @@ class SydpowerConnector:
                     if isinstance(product.get(key), (str, int))
                 }
         return result
+
+    def load_cached_devices(self, cached):
+        """Start from identities saved by an earlier discovery."""
+        self.devices = self.device_descriptors(cached)
+        self._saved_descriptors = {
+            mac: dict(record) for mac, record in self.devices.items()
+        }
+
+    async def _persist_devices(self):
+        """Save identities when they differ from what was last saved."""
+        descriptors = self.device_descriptors(self.devices)
+        if descriptors == self._saved_descriptors or not self.on_device_list:
+            return
+        self._saved_descriptors = descriptors
+        try:
+            await self.on_device_list(descriptors)
+        except Exception as err:
+            self._logger.warning("Cannot persist device identities: %s", err)
+
+    async def _refresh_discovery(self):
+        """Look for stations added to the account since the cache was saved.
+
+        Runs in the background after a start from cached identities, so the
+        cloud is never on the path to local telemetry. New stations are saved
+        and appear after the integration is reloaded; names of known ones are
+        updated in place.
+        """
+        if self.api_client is None:
+            self.api_client = APIClient(self.api_token)
+        devices = await asyncio.wait_for(self.api_client.get_devices(), timeout=15)
+        discovered = self.device_descriptors(devices)
+        if not discovered:
+            return
+        added = sorted(set(discovered) - set(self.devices))
+        for mac, record in discovered.items():
+            if mac in self.devices:
+                if "device_name" in record:
+                    self.devices[mac]["device_name"] = record["device_name"]
+                if "productInfo" in record:
+                    self.devices[mac]["productInfo"] = record["productInfo"]
+        if added:
+            # Kept out of self.devices: the MQTT client subscribed to the
+            # cached list, and platforms were set up for it.
+            descriptors = self.device_descriptors(self.devices)
+            descriptors.update({mac: discovered[mac] for mac in added})
+            self._saved_descriptors = descriptors
+            if self.on_device_list:
+                await self.on_device_list(descriptors)
+            self._logger.warning(
+                "New station(s) %s found on the account; reload the "
+                "integration to add them", ", ".join(added),
+            )
+        else:
+            await self._persist_devices()
 
     async def connect(self):
         """Serialize broker setup; an offline device does not invalidate it."""
@@ -141,17 +202,22 @@ class SydpowerConnector:
                     if not descriptors:
                         raise ValueError("No valid device identities available")
                     self.devices = descriptors
-                    if self.on_device_list:
-                        try:
-                            await self.on_device_list(descriptors)
-                        except Exception as err:
-                            self._logger.warning(
-                                "Cannot persist device identities: %s", err
-                            )
+                    self._discovery_refreshed = True
+                    await self._persist_devices()
+                elif not self._discovery_refreshed:
+                    self._discovery_refreshed = True
+                    self._start_background(self._refresh_discovery())
                 await self._cleanup_transport()
                 client = MQTTClient(self.loop)
                 client.on_disconnect_callback = self._handle_mqtt_disconnect
                 client.on_device_state_callback = self._handle_device_state
+                client.seed_protocols(
+                    {
+                        mac: record["protocolProfile"]
+                        for mac, record in self.devices.items()
+                        if "protocolProfile" in record
+                    }
+                )
                 self.mqtt_client = client
                 await asyncio.wait_for(
                     client.connect(
@@ -181,7 +247,7 @@ class SydpowerConnector:
         if not task.cancelled():
             error = task.exception()
             if error:
-                self._logger.debug("Optional cloud state sync failed: %s", error)
+                self._logger.debug("Optional cloud request failed: %s", error)
 
     async def _handle_device_state(self, device_mac, online):
         if self._closing or device_mac not in self.devices:
@@ -266,6 +332,10 @@ class SydpowerConnector:
                 # HA was stopped. A fresh input reply is also online evidence.
                 if mac not in self._online_announced:
                     self._schedule_platform_state(mac, True)
+        if self.on_device_list:
+            # A newly learned register profile is worth keeping for a start
+            # with the station off.
+            self._start_background(self._persist_devices())
         return fresh
 
     def _send_read_request(self, device_mac: str, func: int = 3) -> None:
@@ -325,6 +395,16 @@ class SydpowerConnector:
         self, device_id: str, command: str, value=None
     ) -> bool:
         """Run a command on a device. Returns True if successful."""
+        if self.devices.get(device_id, {}).get("protocolProfile", 0) != 0:
+            # Every command below addresses the V0 register layout. On a V1
+            # station those registers mean something else entirely.
+            self._logger.error(
+                "Refused %s on %s: the station uses register profile V1, "
+                "which is read-only in this integration",
+                command,
+                device_id,
+            )
+            return False
         # Resolve command bytes
         if command in COMMANDS:
             command_bytes = COMMANDS[command]

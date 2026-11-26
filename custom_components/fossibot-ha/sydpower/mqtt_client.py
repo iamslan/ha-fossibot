@@ -126,6 +126,16 @@ class MQTTClient:
             await self.disconnect()
             raise
 
+    def seed_protocols(self, protocols: Dict[str, int]) -> None:
+        """Register profiles known from an earlier session.
+
+        Input frames are only decoded once a station's profile is known, so
+        seeding lets the first poll after a restart decode even if its
+        settings reply is lost. A settings frame still overrides the seed.
+        """
+        for mac, protocol in protocols.items():
+            self._protocol.setdefault(mac, protocol)
+
     def _on_connect(self, client, userdata, flags, rc):
         """Callback when MQTT connects."""
         self._logger.debug(
@@ -264,6 +274,10 @@ class MQTTClient:
             device_update = parse_registers(
                 registers, topic, self._protocol.get(device_mac, 0)
             )
+            if device_update and "client/data" in topic:
+                device_update.setdefault(
+                    "protocolProfile", self._protocol[device_mac]
+                )
 
             # Determine topic type for logging
             if "client/04" in topic:

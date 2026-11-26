@@ -17,8 +17,17 @@ _VERSION_FIELDS = (
 
 
 def device_profile(coordinator, device_id: str) -> int:
-    """Register profile of a device: 0 = V0 document, 1 = V1 (registers_v1)."""
-    return coordinator.data.get(device_id, {}).get("protocolProfile", 0)
+    """Register profile of a device: 0 = V0 document, 1 = V1 (registers_v1).
+
+    Falls back to the identity saved by an earlier session, so a V1 station
+    that is off when Home Assistant starts does not get V0 controls.
+    """
+    profile = coordinator.data.get(device_id, {}).get("protocolProfile")
+    if profile is None:
+        profile = coordinator.connector.devices.get(device_id, {}).get(
+            "protocolProfile", 0
+        )
+    return profile
 
 
 def definitions_for(definitions, profile: int):
@@ -41,6 +50,10 @@ class FossibotEntity(CoordinatorEntity):
     duplicate this code.
     """
 
+    # Entity names are relative to the device ("AC Output"), so the friendly
+    # name follows the device's name, including one the user set in HA.
+    _attr_has_entity_name = True
+
     def __init__(self, coordinator, device_id: str) -> None:
         """Initialize the entity."""
         super().__init__(coordinator)
@@ -60,7 +73,12 @@ class FossibotEntity(CoordinatorEntity):
         versions, 72-79 serial number), so the device page shows real
         hardware detail rather than just a MAC address.
         """
-        device_data = self.coordinator.data.get(self._device_id, {})
+        # Identity saved by discovery, overlaid with the latest readings, so
+        # the device keeps its name while the station is off.
+        device_data = {
+            **self.coordinator.connector.devices.get(self._device_id, {}),
+            **self.coordinator.data.get(self._device_id, {}),
+        }
         name = device_data.get("device_name") or f"Fossibot {self._device_id}"
 
         info = {
