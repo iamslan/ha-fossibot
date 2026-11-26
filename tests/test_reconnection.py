@@ -30,13 +30,18 @@ Connector = connector_module.SydpowerConnector
 class FakeCloud:
     calls = 0
     updates = []
+    fail_discovery = False
+    extra_devices = {}
 
     def __init__(self, token):
         self.closed = False
 
     async def get_devices(self):
         FakeCloud.calls += 1
+        if FakeCloud.fail_discovery:
+            raise OSError("cloud unreachable")
         return {
+            **FakeCloud.extra_devices,
             MAC: {
                 "_modbus_address": 17,
                 "_modbus_count": 80,
@@ -84,6 +89,9 @@ class FakeBroker:
 
     def clear_message_cache(self):
         pass
+
+    def seed_protocols(self, protocols):
+        self.seeded_protocols = dict(protocols)
 
     def publish_command(self, mac, frame):
         self.published.append((mac, frame))
@@ -173,6 +181,8 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
             self.addCleanup(patcher.stop)
         FakeCloud.calls = 0
         FakeCloud.updates = []
+        FakeCloud.fail_discovery = False
+        FakeCloud.extra_devices = {}
         FakeBroker.instances.clear()
         FakeBroker.station_online = True
         FakeBroker.fail_connect = False
@@ -200,9 +210,58 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         return result
 
     async def test_cached_identity_connects_without_cloud(self):
+        FakeCloud.fail_discovery = True
         c = self.connector()
         self.assertTrue(await c.connect())
-        self.assertEqual(FakeCloud.calls, 0)
+        data = await c.get_data()
+        self.assertEqual(data[MAC]["soc"], 85.2)
+
+    async def test_cached_start_refreshes_discovery_in_background(self):
+        c = self.connector()
+        saved = []
+
+        async def save(value):
+            saved.append(value)
+
+        c.on_device_list = save
+        FakeCloud.extra_devices = {OTHER: {"device_name": "Second"}}
+        self.assertTrue(await c.connect())
+        await asyncio.sleep(0.01)
+        self.assertEqual(FakeCloud.calls, 1)
+        # Known station renamed in place; the new one is saved for the next
+        # reload but not polled by a client that never subscribed to it.
+        self.assertEqual(c.devices[MAC]["device_name"], "F2400-B")
+        self.assertNotIn(OTHER, c.devices)
+        self.assertEqual(saved[-1][OTHER]["device_name"], "Second")
+        await c.connect()
+        await asyncio.sleep(0.01)
+        self.assertEqual(FakeCloud.calls, 1)
+
+    async def test_learned_profile_is_persisted_and_seeded(self):
+        c = self.connector()
+        saved = []
+
+        async def save(value):
+            saved.append(value)
+
+        c.on_device_list = save
+        c.devices[MAC]["protocolProfile"] = 1
+        await c.get_data()
+        await asyncio.sleep(0.01)
+        self.assertEqual(saved[-1][MAC]["protocolProfile"], 1)
+        restarted = self.connector()
+        restarted.load_cached_devices(saved[-1])
+        await restarted.connect()
+        self.assertEqual(restarted.mqtt_client.seeded_protocols, {MAC: 1})
+
+    async def test_v0_commands_are_refused_on_v1_station(self):
+        c = self.connector()
+        await c.connect()
+        c.devices[MAC]["protocolProfile"] = 1
+        client = c.mqtt_client
+        self.assertFalse(await c.run_command(MAC, "REGEnableACOutput"))
+        self.assertFalse(await c.run_command(MAC, "write_register", (57, 1)))
+        self.assertEqual(client.published, [])
 
     async def test_fresh_read_syncs_cloud_after_cached_start_without_online_marker(
         self,
@@ -210,7 +269,7 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         c = self.connector()
         await c.get_data()
         await asyncio.sleep(0.01)
-        self.assertEqual(FakeCloud.calls, 0)
+        self.assertEqual(FakeCloud.calls, 1)  # background discovery refresh
         self.assertEqual(FakeCloud.updates, [("AA:BB:CC:DD:EE:FF", True)])
         await c.get_data()
         await asyncio.sleep(0.01)
@@ -244,7 +303,9 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.original_wait_for(c.reconnect(), 0.2))
         self.assertIsNot(c.mqtt_client, old)
         self.assertEqual(old.disconnect_count, 1)
-        self.assertEqual(FakeCloud.calls, 0)
+        # Only the one background discovery refresh of the first start;
+        # broker recovery never goes back to the cloud.
+        self.assertEqual(FakeCloud.calls, 1)
 
     async def test_concurrent_reconnect_has_one_replacement(self):
         c = self.connector()
@@ -350,6 +411,7 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
     async def test_setup_offline_with_saved_identity_keeps_unavailable_entities(self):
         FakeStore.value = Connector.device_descriptors({MAC: {}})
         FakeBroker.station_online = False
+        FakeCloud.fail_discovery = True
         h = FakeHass()
         entry = types.SimpleNamespace(
             entry_id="test-entry", data={"api_token": "test", "mqtt_host": "test"}
@@ -360,7 +422,6 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(co.last_update_success)
         self.assertEqual(co.data, {MAC: {}})
         self.assertTrue(co.connector.is_connected())
-        self.assertEqual(FakeCloud.calls, 0)
         FakeBroker.station_online = True
         await co.async_request_refresh()
         self.assertTrue(co.last_update_success)
@@ -443,6 +504,7 @@ class MQTTTests(unittest.IsolatedAsyncioTestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         self.client = self.module.MQTTClient(asyncio.get_running_loop())
+        self.client.seed_protocols({MAC: 0})
 
     async def test_retained_measurement_is_not_accepted(self):
         msg = types.SimpleNamespace(

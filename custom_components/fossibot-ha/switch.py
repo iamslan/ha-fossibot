@@ -10,7 +10,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .coordinator import FossibotDataUpdateCoordinator
-from .entity import FossibotEntity
+from .entity import FossibotEntity, device_profile
 from .sydpower.modbus import pack_byte_pair, NOT_SET
 from .sydpower.const import (
     HREG_APP_CONTROL_SLEEP,
@@ -78,6 +78,9 @@ async def async_setup_entry(
 
     entities: list[SwitchEntity] = []
     for device_id in coordinator.data:
+        if device_profile(coordinator, device_id) != 0:
+            # V1 outputs are bits of input 75, not holding 24-26: no writes yet
+            continue
         entities.extend(
             FossibotSwitch(coordinator, device_id, **defn)
             for defn in SWITCH_DEFINITIONS
@@ -103,7 +106,7 @@ class _FossibotSwitchBase(FossibotEntity, SwitchEntity):
     ) -> None:
         super().__init__(coordinator, device_id)
         self._key = key
-        self._attr_name = f"Fossibot {device_id} {name}"
+        self._attr_name = name
         self._attr_unique_id = f"{device_id}_{key}"
         self._attr_entity_category = category
 
@@ -133,19 +136,28 @@ class FossibotSwitch(_FossibotSwitchBase):
         self._on_command = on_command
         self._off_command = off_command
 
+    async def _send(self, command: str, target: bool) -> None:
+        # Some firmware (confirmed on the F2400) treats any write to the
+        # USB/DC/AC output registers as a toggle, whatever the value. Sending
+        # "on" to an output that is already on would switch it off, so skip
+        # the write when the last fresh reading already matches. With no
+        # reading yet the command is sent as before.
+        if self.coordinator.last_update_success and self.is_on is target:
+            _LOGGER.debug(
+                "%s already %s on %s, not sending %s",
+                self._key, "on" if target else "off", self._device_id, command,
+            )
+            return
+        await self.coordinator.connector.run_command(self._device_id, command)
+        await self.coordinator.async_request_refresh()
+
     async def async_turn_on(self, **kwargs):
         """Turn the switch on."""
-        await self.coordinator.connector.run_command(
-            self._device_id, self._on_command
-        )
-        await self.coordinator.async_request_refresh()
+        await self._send(self._on_command, True)
 
     async def async_turn_off(self, **kwargs):
         """Turn the switch off."""
-        await self.coordinator.connector.run_command(
-            self._device_id, self._off_command
-        )
-        await self.coordinator.async_request_refresh()
+        await self._send(self._off_command, False)
 
 
 class FossibotRegisterSwitch(_FossibotSwitchBase):

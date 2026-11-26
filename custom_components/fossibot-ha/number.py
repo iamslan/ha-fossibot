@@ -10,7 +10,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .coordinator import FossibotDataUpdateCoordinator
-from .entity import FossibotEntity
+from .entity import FossibotEntity, device_profile
 from .sydpower.modbus import NOT_SET, pack_byte_pair
 from .sydpower.const import (
     HREG_LOW_BATTERY_NOTIFY,
@@ -129,6 +129,7 @@ async def async_setup_entry(
     entities = [
         FossibotNumber(coordinator, device_id, **defn)
         for device_id in coordinator.data
+        if device_profile(coordinator, device_id) == 0  # V0 holding registers only
         for defn in NUMBER_DEFINITIONS
     ]
 
@@ -163,7 +164,7 @@ class FossibotNumber(FossibotEntity, NumberEntity):
         self._max_from_key = max_from_key
         self._pack_high = pack_high
         self._declared_max = max_value
-        self._attr_name = f"Fossibot {device_id} {name}"
+        self._attr_name = name
         self._attr_unique_id = f"{device_id}_{key}"
         self._attr_native_min_value = min_value
         self._attr_native_step = step

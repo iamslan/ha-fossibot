@@ -36,7 +36,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     store = Store(hass, 1, f"{DOMAIN}.{entry.entry_id}.devices")
     cached = await store.async_load()
-    coordinator.connector.devices = coordinator.connector.device_descriptors(cached)
+    coordinator.connector.load_cached_devices(cached)
     coordinator.connector.on_device_list = store.async_save
     try:
         await coordinator.async_config_entry_first_refresh()

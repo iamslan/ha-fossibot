@@ -17,6 +17,7 @@ from .modbus import (
     high_low_to_int,
     parse_registers,
 )
+from .registers_v1 import detect_protocol
 
 CONNECTION_CODES = {
     0: "Connection successful",
@@ -42,6 +43,9 @@ class MQTTClient:
 
         # Device data
         self.devices: Dict[str, Any] = {}
+        # Register profile per device (0 = V0, 1 = V1), learned from the
+        # holding frame, which the poll requests before the input frame.
+        self._protocol: Dict[str, int] = {}
         self._device_data_lock = asyncio.Lock()
 
         # Message deduplication
@@ -121,6 +125,16 @@ class MQTTClient:
             self._logger.error("MQTT connection failed: %s", e)
             await self.disconnect()
             raise
+
+    def seed_protocols(self, protocols: Dict[str, int]) -> None:
+        """Register profiles known from an earlier session.
+
+        Input frames are only decoded once a station's profile is known, so
+        seeding lets the first poll after a restart decode even if its
+        settings reply is lost. A settings frame still overrides the seed.
+        """
+        for mac, protocol in protocols.items():
+            self._protocol.setdefault(mac, protocol)
 
     def _on_connect(self, client, userdata, flags, rc):
         """Callback when MQTT connects."""
@@ -242,7 +256,28 @@ class MQTTClient:
                 )
                 return
 
-            device_update = parse_registers(registers, topic)
+            if "client/data" in topic:
+                protocol = detect_protocol(registers)
+                if self._protocol.get(device_mac) != protocol:
+                    self._logger.info(
+                        "Device %s uses register profile V%d", device_mac, protocol,
+                    )
+                self._protocol[device_mac] = protocol
+            elif device_mac not in self._protocol:
+                # Input words mean different things per profile; wait for
+                # the holding frame rather than decode with the wrong table.
+                self._logger.debug(
+                    "Profile of %s unknown yet, skipping input frame", device_mac,
+                )
+                return
+
+            device_update = parse_registers(
+                registers, topic, self._protocol.get(device_mac, 0)
+            )
+            if device_update and "client/data" in topic:
+                device_update.setdefault(
+                    "protocolProfile", self._protocol[device_mac]
+                )
 
             # Determine topic type for logging
             if "client/04" in topic:

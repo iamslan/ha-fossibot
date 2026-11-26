@@ -90,7 +90,10 @@ class TestDefinitionsMatchEntitySignatures:
                 try:
                     # self, coordinator and device_id are supplied positionally
                     # by the platform; the definition provides the rest.
-                    signature.bind(None, None, "device-id", **defn)
+                    # "profile" is consumed by definitions_for() before
+                    # the definition reaches the entity.
+                    signature.bind(None, None, "device-id", **{
+                        k: v for k, v in defn.items() if k != "profile"})
                 except TypeError as err:
                     errors.append(
                         "%s.%s entry %r does not match %s.__init__: %s"
@@ -140,6 +143,14 @@ UNEXPOSED_KEYS = {
     "deviceFrequencyType": "static hardware descriptor",
     "wirelessModules": "static hardware descriptor",
     "storageFlag": "internal device data-storage flag",
+    # Protocol V1 (registers_v1), read-only profile.
+    "protocolProfile": "selects the register table and entity set",
+    "activeStates": "V1 system-state bits as a list; each has its own entity",
+    "systemIdle": "V1 transient state bit, no stable meaning to expose",
+    "ecoSoc": "V1 setting, no confirmed unit or range yet",
+    "upsMode": "V1 setting, no confirmed value map yet",
+    "gridTieMaxPower": "V1 setting, no confirmed unit or range yet",
+    "chargePriority": "V1 setting, no confirmed value map yet",
 }
 
 
@@ -169,6 +180,15 @@ class TestEntityCoverage:
             regs[index] = 0x4142   # printable serial-number characters
         keys.update(parse_registers(regs, "device/response/client/04").keys())
         keys.update(parse_registers(regs, "device/response/client/data").keys())
+        # Protocol V1 stations (registers_v1) decode the same frames with a
+        # different table; their keys count too.
+        v1 = [0x0101] * 100
+        for index in (53, 54, 75):
+            v1[index] = 0xFFFF     # every state bit set
+        for index in range(31, 36):
+            v1[index] = 50         # main and slave packs present
+        keys.update(parse_registers(v1, "device/response/client/04", 1).keys())
+        keys.update(parse_registers(v1, "device/response/client/data", 1).keys())
         return keys
 
     @staticmethod

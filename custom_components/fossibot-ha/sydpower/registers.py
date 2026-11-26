@@ -470,7 +470,7 @@ _INPUT_SCALARS: Tuple[Tuple[str, int, float], ...] = (
     ("pd4Power", IREG_PD4_POWER, 0.1),
     ("pd5Power", IREG_PD5_POWER, 0.1),
     ("totalOutput", IREG_TOTAL_DISCHARGE_POWER, 1),
-    ("batteryUsableCapacity", IREG_BATTERY_USABLE_CAPACITY, 1),
+    ("batteryUsableCapacity", IREG_BATTERY_USABLE_CAPACITY, 0.1),  # 0.1 Ah
     ("chargeAppointmentRemaining", IREG_CHARGE_APPOINTMENT_REMAINING, 1),
     ("remainingChargeTime", IREG_REMAINING_CHARGE_TIME, 1),
     ("remainingDischargeTime", IREG_REMAINING_DISCHARGE_TIME, 1),

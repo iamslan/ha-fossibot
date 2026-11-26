@@ -51,6 +51,9 @@ Assistant. The device connects to it directly.
 After the first successful discovery, Home Assistant stores only device identities,
 names and Modbus addressing locally. This cache contains no API token or sensor
 readings. Reconnecting to the broker does not require another cloud discovery.
+After a start from saved identities, the integration checks the account once in
+the background: a station added since is saved and appears after you reload
+the integration (a warning in the log says so).
 
 ## Supported devices
 
@@ -59,7 +62,7 @@ platform and should work:
 
 | Brand | Models |
 |-------|--------|
-| **FOSSiBOT** | F1200, F2400, F3600, F3600 Pro |
+| **FOSSiBOT** | F1200, F2400, F3600, F3600 Pro, F7200 (protocol V1, sensors only — see below) |
 | **AFERIY** | P210, P310 |
 | **Eco Play (ECOPLAY)** | SYD2400, SYD3600, 3600 Pro |
 | **ABOK Power** | Ark3600 |
@@ -148,6 +151,13 @@ them from the device page when you actually need it.
 
 Rows marked **†** are the disabled-by-default ones.
 
+Entity names are relative to the device (`AC Output`, `State of Charge`), and
+Home Assistant shows them prefixed with the device's name. To give a station a
+short, readable name, rename the **device** (Settings → Devices → your station
+→ ✏️): every entity's display name follows, and Home Assistant offers to
+rename their entity IDs in the same step. Existing entity IDs are not changed
+on upgrade.
+
 ### Sensors
 
 **Battery**
@@ -156,7 +166,7 @@ Rows marked **†** are the disabled-by-default ones.
 |--------|------|-------|
 | State of Charge | % | Main pack |
 | State of Charge Slave 1 – 4 | % | One per connected expansion battery |
-| Battery Usable Capacity | Ah | As reported by the BMS |
+| Battery Usable Capacity | Ah | As reported by the BMS (0.1 Ah resolution) |
 | Average Charge SoC / Average Discharge SoC | % | Diagnostic |
 | Battery Chemistry † | — | Capacity and cell topology in the attributes |
 
@@ -232,14 +242,20 @@ Rows marked **†** are the disabled-by-default ones.
 
 | Entity | Description |
 |--------|-------------|
-| USB Output | Toggle the USB ports |
-| DC Output | Toggle the DC output |
-| AC Output | Toggle the AC inverter |
+| USB Output | Turn the USB ports on or off |
+| DC Output | Turn the DC output on or off |
+| AC Output | Turn the AC inverter on or off |
 | AC Silent Charging | Quieter, slower mains charging |
 | Buzzer | Device beeper |
 | Grid Mode AC Auto Output | Enable AC output automatically when mains appears |
 | App Remote Shutdown | Allow the unit to be shut down remotely |
 | Low Battery Notification | Enable the low-battery alert |
+
+Some firmware (confirmed on the F2400) flips the USB, DC and AC outputs on
+*any* write to their register, whatever the value. The integration therefore
+skips the command when the last fresh reading already shows the requested
+state, so `switch.turn_on` on an output that is already on leaves it on. If
+the station has not answered a poll yet, the command is sent as before.
 
 ### Selects
 
@@ -326,6 +342,16 @@ it — Home Assistant being able to reach the broker is not sufficient.
 **Slave battery sensors read "unknown".**
 Expected when no expansion battery is attached; the register reports "not
 connected" and the sensor stays empty rather than showing 0%.
+
+## Protocol V1 stations (F7200)
+
+Newer stations report protocol version 1 in holding register 7 and use a
+different register layout (`sydpower/registers_v1.py`, indices taken from the
+BrightEMS app bundle). The integration detects this from the first settings
+frame and decodes with the V1 table: inputs, SoC, state bits, timers and the
+PV energy counters. Outputs on V1 are bits of input register 75 rather than
+holding registers 24-26, and the write path is not implemented yet, so such a
+device gets sensors and binary sensors only — no switches, selects or numbers.
 
 ## Not supported
 
