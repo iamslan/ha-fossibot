@@ -71,6 +71,7 @@ class SydpowerConnector:
         self._io_lock = asyncio.Lock()
         self._reconnect_task = None
         self._background_tasks = set()
+        self._online_announced = set()
         self._closing = False
         self._last_successful_communication = 0
 
@@ -189,17 +190,30 @@ class SydpowerConnector:
         # a fresh read; an online marker is never accepted as telemetry.
         if online and self.on_device_available:
             self.on_device_available()
+        self._schedule_platform_state(device_mac, online)
+
+    def _schedule_platform_state(self, device_mac, online):
+        if online:
+            self._online_announced.add(device_mac)
+        else:
+            self._online_announced.discard(device_mac)
         if self.api_client is None:
             self.api_client = APIClient(self.api_token)
-        if self.api_client:
-            self._start_background(
-                asyncio.wait_for(
-                    self.api_client.update_mqtt_state(
-                        self.devices[device_mac]["_raw_device_id"], online
-                    ),
-                    timeout=10,
-                )
+        self._start_background(self._sync_platform_state(device_mac, online))
+
+    async def _sync_platform_state(self, device_mac, online):
+        success = False
+        try:
+            success = await asyncio.wait_for(
+                self.api_client.update_mqtt_state(
+                    self.devices[device_mac]["_raw_device_id"], online
+                ),
+                timeout=10,
             )
+        finally:
+            # Retry on a later fresh read if optional cloud sync failed.
+            if online and not success:
+                self._online_announced.discard(device_mac)
 
     async def get_data(self):
         if not await self.connect():
@@ -248,6 +262,10 @@ class SydpowerConnector:
                 self.devices[mac].update(sensors[mac])
                 fresh[mac] = self.devices[mac].copy()
                 self._last_successful_communication = time.time()
+                # A non-retained online marker may have been published while
+                # HA was stopped. A fresh input reply is also online evidence.
+                if mac not in self._online_announced:
+                    self._schedule_platform_state(mac, True)
         return fresh
 
     def _send_read_request(self, device_mac: str, func: int = 3) -> None:

@@ -29,6 +29,7 @@ Connector = connector_module.SydpowerConnector
 
 class FakeCloud:
     calls = 0
+    updates = []
 
     def __init__(self, token):
         self.closed = False
@@ -49,6 +50,7 @@ class FakeCloud:
         self.closed = True
 
     async def update_mqtt_state(self, *args):
+        FakeCloud.updates.append(args)
         return True
 
 
@@ -170,6 +172,7 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         FakeCloud.calls = 0
+        FakeCloud.updates = []
         FakeBroker.instances.clear()
         FakeBroker.station_online = True
         FakeBroker.fail_connect = False
@@ -200,6 +203,18 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         c = self.connector()
         self.assertTrue(await c.connect())
         self.assertEqual(FakeCloud.calls, 0)
+
+    async def test_fresh_read_syncs_cloud_after_cached_start_without_online_marker(
+        self,
+    ):
+        c = self.connector()
+        await c.get_data()
+        await asyncio.sleep(0.01)
+        self.assertEqual(FakeCloud.calls, 0)
+        self.assertEqual(FakeCloud.updates, [("AA:BB:CC:DD:EE:FF", True)])
+        await c.get_data()
+        await asyncio.sleep(0.01)
+        self.assertEqual(len(FakeCloud.updates), 1)
 
     async def test_initial_discovery_persists_no_telemetry_or_credentials(self):
         c = self.connector()
