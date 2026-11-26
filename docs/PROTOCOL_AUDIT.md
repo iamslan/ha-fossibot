@@ -190,7 +190,7 @@ thrown away.
 | input 26-28 | USB 1-3 power |
 | input 30-32 | QC 1-3 power |
 | input 34-38 | PD 1-5 power |
-| input 54 | Battery usable capacity (Ah) |
+| input 54 | Battery usable capacity (0.1 Ah per count — a 40 Ah F2400-B pack reads 390, see #41) |
 | input 57/58/59 | Charge schedule remaining, remaining charge / discharge time |
 | input 60 | PV lifetime energy — `TOTAL_INCREASING`, so it feeds the HA energy dashboard |
 | input 66/67 | Slave battery 3 and 4 SOC |

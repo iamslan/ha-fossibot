@@ -164,7 +164,7 @@ class FossibotNumber(FossibotEntity, NumberEntity):
         self._max_from_key = max_from_key
         self._pack_high = pack_high
         self._declared_max = max_value
-        self._attr_name = f"Fossibot {device_id} {name}"
+        self._attr_name = name
         self._attr_unique_id = f"{device_id}_{key}"
         self._attr_native_min_value = min_value
         self._attr_native_step = step

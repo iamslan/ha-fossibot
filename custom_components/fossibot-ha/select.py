@@ -148,7 +148,7 @@ class FossibotRegisterSelect(FossibotEntity, SelectEntity):
         self._register = register
         self._options_map = options                        # label → register value
         self._reverse_map = {v: k for k, v in options.items()}  # register value → label
-        self._attr_name = f"Fossibot {device_id} {name}"
+        self._attr_name = name
         self._attr_unique_id = f"{device_id}_{unique_id_suffix or key}"
         self._attr_options = list(options.keys())
         self._attr_entity_category = category

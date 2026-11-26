@@ -207,7 +207,7 @@ class FossibotSensor(FossibotEntity, SensorEntity):
         super().__init__(coordinator, device_id)
         self._key = key
         self._attribute_keys = attribute_keys
-        self._attr_name = f"Fossibot {device_id} {name}"
+        self._attr_name = name
         self._attr_native_unit_of_measurement = unit
         self._attr_device_class = device_class
         self._attr_unique_id = f"{device_id}_{key}"

@@ -160,7 +160,7 @@ class FossibotBinarySensor(FossibotEntity, BinarySensorEntity):
         super().__init__(coordinator, device_id)
         self._key = key
         self._attribute_keys = attribute_keys
-        self._attr_name = f"Fossibot {device_id} {name}"
+        self._attr_name = name
         self._attr_unique_id = f"{device_id}_{key}"
         self._attr_device_class = device_class
         self._attr_entity_category = category
