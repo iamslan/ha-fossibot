@@ -12,7 +12,10 @@ import paho.mqtt.client as mqtt
 from .const import DEFAULT_MQTT_PORT
 from .logger import SmartLogger
 from .modbus import (
-    MIN_DATA_REGISTERS, REGRequestSettings, high_low_to_int, parse_registers,
+    MIN_DATA_REGISTERS,
+    REGRequestSettings,
+    high_low_to_int,
+    parse_registers,
 )
 
 CONNECTION_CODES = {
@@ -32,6 +35,8 @@ class MQTTClient:
         self.mqtt_client: Optional[mqtt.Client] = None
         self.connected = asyncio.Event()
         self.data_updated = asyncio.Event()
+        self.response_events = {}
+        self.responses = {}
         self.loop = loop
         self._logger = SmartLogger(__name__)
 
@@ -75,9 +80,7 @@ class MQTTClient:
             self._is_disconnecting = False
             self.connected.clear()
 
-            hex_string = "".join(
-                random.choice("0123456789abcdef") for _ in range(24)
-            )
+            hex_string = "".join(random.choice("0123456789abcdef") for _ in range(24))
             timestamp_ms = int(time.time() * 1000)
             client_id = f"fossibot_ha_{hex_string}_{timestamp_ms}"
 
@@ -98,7 +101,9 @@ class MQTTClient:
 
             self._device_ids = device_ids
 
-            self.mqtt_client.connect(mqtt_host, mqtt_port, keepalive=30)
+            await asyncio.to_thread(
+                self.mqtt_client.connect, mqtt_host, mqtt_port, keepalive=30
+            )
             self.mqtt_client.loop_start()
 
             try:
@@ -106,13 +111,15 @@ class MQTTClient:
                 self._logger.debug("MQTT connection established successfully")
             except asyncio.TimeoutError:
                 self._logger.error("MQTT connection timeout after 30 seconds")
-                self.mqtt_client.loop_stop()
+                await self.disconnect()
                 raise
 
+        except asyncio.CancelledError:
+            await self.disconnect()
+            raise
         except Exception as e:
             self._logger.error("MQTT connection failed: %s", e)
-            if self.mqtt_client:
-                self.mqtt_client.loop_stop()
+            await self.disconnect()
             raise
 
     def _on_connect(self, client, userdata, flags, rc):
@@ -152,16 +159,7 @@ class MQTTClient:
         client.subscribe(subscribe_topics)
         self._logger.debug("Subscribed to %d topics", len(subscribe_topics))
 
-        for device_mac in self._device_ids:
-            client.publish(
-                f"{device_mac}/client/request/data",
-                bytes(REGRequestSettings),
-                qos=1,
-            )
-            self._logger.debug(
-                "Published func 03 request to %s on connect", device_mac
-            )
-
+        # Connector reads after subscription, using each device's address.
         self.loop.call_soon_threadsafe(self.connected.set)
 
     def _on_message(self, client, userdata, msg):
@@ -173,6 +171,11 @@ class MQTTClient:
             # Handle device connection state messages (1 = online, 0 = offline)
             if topic.endswith("/device/response/state"):
                 self._handle_state_message(topic, payload)
+                return
+
+            # A retained measurement predates this connection/read and must
+            # never restore availability of stale battery or power values.
+            if msg.retain:
                 return
 
             payload_list = list(payload)
@@ -192,7 +195,11 @@ class MQTTClient:
                         del self._message_cache[key]
                     self._last_cache_cleanup = current_time
 
-                if message_id in self._message_cache:
+                if (
+                    message_id in self._message_cache
+                    and current_time - self._message_cache[message_id]
+                    < self._message_cache_ttl
+                ):
                     age = current_time - self._message_cache[message_id]
                     self._logger.debug(
                         "Dedup: dropping duplicate on %s (%.1fs old)",
@@ -221,7 +228,8 @@ class MQTTClient:
                 # Short responses (e.g. 1 register) are normal write ACKs
                 self._logger.debug(
                     "Short response (%d registers) from %s — likely write ACK",
-                    len(registers), topic,
+                    len(registers),
+                    topic,
                 )
                 return
 
@@ -253,13 +261,15 @@ class MQTTClient:
                     sorted(device_update.keys()),
                 )
                 asyncio.run_coroutine_threadsafe(
-                    self._update_device_data(device_mac, device_update),
+                    self._update_device_data(
+                        device_mac,
+                        device_update,
+                        4 if topic.endswith("/04") else 3,
+                    ),
                     self.loop,
                 )
             else:
-                self._logger.warning(
-                    "No data extracted from message on %s", topic
-                )
+                self._logger.warning("No data extracted from message on %s", topic)
 
         except Exception as e:
             self._logger.error("Error processing MQTT message: %s", e)
@@ -278,6 +288,8 @@ class MQTTClient:
             # Fallback: interpret raw bytes
             state_str = str(payload[0]) if payload else ""
 
+        if state_str not in ("0", "1"):
+            return
         online = state_str == "1"
         prev_state = self._device_online.get(device_mac)
         self._device_online[device_mac] = online
@@ -286,11 +298,13 @@ class MQTTClient:
             "Device %s state: %s (was %s)",
             device_mac,
             "online" if online else "offline",
-            "online" if prev_state else ("offline" if prev_state is not None else "unknown"),
+            "online"
+            if prev_state
+            else ("offline" if prev_state is not None else "unknown"),
         )
 
         # Notify connector to sync state with platform API
-        if self.on_device_state_callback:
+        if self.on_device_state_callback and online != prev_state:
             asyncio.run_coroutine_threadsafe(
                 self.on_device_state_callback(device_mac, online),
                 self.loop,
@@ -300,12 +314,15 @@ class MQTTClient:
         """Check if a device is reported as online via the state topic."""
         return self._device_online.get(device_mac, False)
 
-    async def _update_device_data(self, device_mac, device_update):
+    async def _update_device_data(self, device_mac, device_update, func):
         """Update device data safely."""
         async with self._device_data_lock:
             if device_mac not in self.devices:
                 self.devices[device_mac] = {}
             self.devices[device_mac].update(device_update)
+            key = (device_mac, func)
+            self.responses[key] = device_update.copy()
+            self.response_events.setdefault(key, asyncio.Event()).set()
             self._last_successful_communication = time.time()
             self.data_updated.set()
             self._logger.debug(
@@ -326,9 +343,7 @@ class MQTTClient:
         if rc != 0:
             self._logger.warning("Unexpected MQTT disconnection (code %s)", rc)
             self.loop.call_soon_threadsafe(
-                lambda: asyncio.create_task(
-                    self._handle_disconnect_callback(rc)
-                )
+                lambda: asyncio.create_task(self._handle_disconnect_callback(rc))
             )
 
     async def _handle_disconnect_callback(self, rc):
@@ -339,21 +354,24 @@ class MQTTClient:
             except Exception as e:
                 self._logger.error("Error in disconnect callback: %s", e)
 
-    def publish_command(self, device_id: str, command: List[int]) -> None:
+    def publish_command(self, device_id: str, command: List[int]) -> bool:
         """Publish a command to a device."""
         if not self.mqtt_client or not self.mqtt_client.is_connected():
             self._logger.error("Cannot send command: MQTT not connected")
-            return
+            return False
 
         try:
             topic = f"{device_id}/client/request/data"
-            self.mqtt_client.publish(topic, bytes(command), qos=1)
+            result = self.mqtt_client.publish(topic, bytes(command), qos=1)
+            if result.rc != mqtt.MQTT_ERR_SUCCESS:
+                self._logger.warning("MQTT publish failed: %s", result.rc)
+                return False
+            return True
         except Exception as e:
             self._logger.error("Error publishing command: %s", e)
+            return False
 
-    def register_message_handler(
-        self, device_id: str, handler: Callable
-    ) -> None:
+    def register_message_handler(self, device_id: str, handler: Callable) -> None:
         """Register a custom message handler for a device."""
         self._message_handlers[device_id] = handler
 
@@ -373,10 +391,9 @@ class MQTTClient:
                 self._is_disconnecting = True
                 self.connected.clear()
                 self.data_updated.clear()
-                self.mqtt_client.loop_stop()
-                self.mqtt_client.disconnect()
+                await asyncio.to_thread(self.mqtt_client.disconnect)
+                await asyncio.to_thread(self.mqtt_client.loop_stop)
                 self._logger.debug("MQTT client disconnected")
-                await asyncio.sleep(0.5)
             except Exception as e:
                 self._logger.error("Error during MQTT disconnect: %s", e)
             finally:

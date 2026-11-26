@@ -34,6 +34,7 @@ INTEGRATION_DIR = (
 # distinct names stay distinct.
 # ---------------------------------------------------------------------------
 
+
 class _StubMeta(type):
     """Metaclass that materialises any attribute as a nested stub class."""
 
@@ -72,6 +73,7 @@ _STUBBED_MODULES = [
     "homeassistant.helpers",
     "homeassistant.helpers.entity",
     "homeassistant.helpers.entity_platform",
+    "homeassistant.helpers.storage",
     "homeassistant.helpers.update_coordinator",
     "voluptuous",
     "aiohttp",
@@ -87,6 +89,45 @@ for _name in _STUBBED_MODULES:
 # Decorators must stay callable and identity-preserving; a stub class would be
 # invoked as ``callback(func)`` and fail.
 sys.modules["homeassistant.core"].callback = lambda func: func
+
+
+class _UpdateFailed(Exception):
+    """Represent a failed fresh read in the lightweight coordinator host."""
+
+
+class _ConfigEntryNotReady(Exception):
+    """Represent a setup failure without importing Home Assistant."""
+
+
+class _DataUpdateCoordinator:
+    """Minimal lifecycle host; fetching remains real integration code."""
+
+    def __init__(self, hass, *args, **kwargs):
+        self.hass = hass
+        self.data = None
+        self.last_update_success = False
+
+    async def async_request_refresh(self):
+        try:
+            self.data = await self._async_update_data()
+            self.last_update_success = True
+        except _UpdateFailed:
+            self.last_update_success = False
+
+    async def async_config_entry_first_refresh(self):
+        await self.async_request_refresh()
+        if not self.last_update_success:
+            raise _ConfigEntryNotReady
+
+    async def async_shutdown(self):
+        self.base_shutdown_called = True
+
+
+sys.modules[
+    "homeassistant.helpers.update_coordinator"
+].DataUpdateCoordinator = _DataUpdateCoordinator
+sys.modules["homeassistant.helpers.update_coordinator"].UpdateFailed = _UpdateFailed
+sys.modules["homeassistant.exceptions"].ConfigEntryNotReady = _ConfigEntryNotReady
 
 
 def _register_package(name: str, directory: Path) -> None:
